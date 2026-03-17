@@ -131,30 +131,19 @@ def predict_combined(prices, steps=1):
         predict_arima(prices, steps)
     ])
 
-# ---------- SCORING ----------
-def score(prices):
-    if len(prices)==0 or np.mean(prices)==0:
-        return 0
-    t = (prices[-1]-prices[0])/prices[0]
-    r = rsi(prices)
-    m = macd(prices)
-    mom = momentum(prices)
-    volatility = np.std(prices)/np.mean(prices)
-    s = 0
-    s += 1.5 if t>0 else -1
-    s += 1 if r<30 else -1 if r>70 else 0
-    s += 1 if m>0 else -1 if m<0 else 0
-    s += 1 if mom>0 else -1
-    s -= volatility
-    return round(s)
-
-def label(score):
-    if score>=3: return "🚀 Strong Buy"
-    elif score==2: return "🟢 Buy"
-    elif score==1: return "🟡 Weak Buy"
-    elif score==0: return "⚖️ Neutral"
-    elif score==-1: return "🟠 Sell"
-    else: return "🔴 Strong Sell"
+# ---------- SCORING BASED ON FUTURE PREDICTION ----------
+def get_signal(current, est):
+    change_pct = (est - current)/current if current>0 else 0
+    if change_pct > 0.03:
+        return "🚀 Strong Buy"
+    elif change_pct > 0:
+        return "🟢 Buy"
+    elif change_pct > -0.02:
+        return "⚖️ Neutral"
+    elif change_pct > -0.05:
+        return "🟠 Sell"
+    else:
+        return "🔴 Strong Sell"
 
 # ---------- UI ----------
 st.title("📊 PRO Smart Crypto Dashboard")
@@ -165,22 +154,20 @@ if st.button("Analyze Market"):
         prices=get_price(c["symbol"],c["cg_id"])
         if len(prices)==0: prices=[0]
         current = prices[-1]
-        s = score(prices)
-        # Smoothed predictions for 24h, 3d, 7d
+
+        # Smoothed predictions
         est1 = predict_combined(prices, steps=1)
-        est3 = predict_combined(prices, steps=3)
-        est7 = predict_combined(prices, steps=7)
-        # Optional smoothing: average of last 3 days for 3d, last 7 for 7d
-        est3 = (est3 + np.mean(prices[-3:]))/2
-        est7 = (est7 + np.mean(prices[-7:]))/2
+        est3 = (predict_combined(prices, steps=3) + np.mean(prices[-3:]))/2
+        est7 = (predict_combined(prices, steps=7) + np.mean(prices[-7:]))/2
+
         st.session_state.results.append({
             "Coin":name,
             "Price":round(current,2),
             "24h %":round((est1-current)/current*100 if current>0 else 0,2),
             "3d %":round((est3-current)/current*100 if current>0 else 0,2),
             "7d %":round((est7-current)/current*100 if current>0 else 0,2),
-            "Signal":label(s),
-            "Score":s,
+            "Signal":get_signal(current, est1),
+            "Score":round((est1-current)/current*100 if current>0 else 0,2),  # optional numeric score
             "Prices":prices
         })
 
