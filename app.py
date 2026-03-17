@@ -55,8 +55,8 @@ def get_current_price_binance(symbol):
 def get_price_coinpaprika(cp_id, days, retries=3, wait=2):
     end = pd.Timestamp.now()
     start = end - pd.Timedelta(days=days)
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = end.strftime("%Y-%m-%d")
+    start_str = start.strftime("%Y-%m-%dT00:00:00Z")
+    end_str = end.strftime("%Y-%m-%dT23:59:59Z")
     url = f"https://api.coinpaprika.com/v1/coins/{cp_id}/ohlcv/historical?start={start_str}&end={end_str}"
 
     for _ in range(retries):
@@ -68,11 +68,7 @@ def get_price_coinpaprika(cp_id, days, retries=3, wait=2):
                     return closes
         except:
             time.sleep(wait)
-    # Only use current price fallback if all fail
-    current = get_current_price_coinpaprika(cp_id)
-    if current:
-        return [current] * max(1, days)
-    return [0] * max(1, days)
+    return []  # let fallback handle
 
 def get_current_price_coinpaprika(cp_id):
     try:
@@ -88,24 +84,24 @@ def get_price(coin_name, days):
     binance_symbol = coins[coin_name]["symbol"]
     cp_id = coins[coin_name]["cp_id"]
 
-    # Try CoinPaprika first for historical (more reliable)
+    # 1️⃣ Try CoinPaprika historical
     prices = get_price_coinpaprika(cp_id, days)
-    if prices and any(p != 0 for p in prices):
+    if prices:
         return prices
 
-    # Fallback to CoinGecko
+    # 2️⃣ Try CoinGecko
     prices = get_price_coingecko(cg_id, days)
     if prices:
         return prices
 
-    # Fallback to Binance
+    # 3️⃣ Try Binance
     interval = '1h'
-    limit = days * 24
+    limit = days*24
     prices = get_price_binance(binance_symbol, interval=interval, limit=limit)
     if prices:
         return prices
 
-    # Last resort: fill with current price
+    # 4️⃣ Last resort: fill with current price
     current = get_current_price(coin_name)
     return [current] * max(1, days)
 
