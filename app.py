@@ -103,6 +103,27 @@ def macd(prices):
 def momentum(prices):
     return prices[-1]-prices[-5] if len(prices)>5 else 0
 
+# ---------- BOLLINGER & STOCHASTIC ----------
+def bollinger_bands(prices, period=20, k=2):
+    if len(prices) < period:
+        mean = np.mean(prices) if prices else 0
+        return mean, mean
+    s = pd.Series(prices)
+    sma = s.rolling(window=period).mean().iloc[-1]
+    std = s.rolling(window=period).std().iloc[-1]
+    upper = sma + k*std
+    lower = sma - k*std
+    return upper, lower
+
+def stochastic_oscillator(prices, period=14):
+    if len(prices) < period:
+        return 50
+    s = pd.Series(prices[-period:])
+    low = s.min()
+    high = s.max()
+    k = 100 * (s.iloc[-1] - low) / (high - low) if high != low else 50
+    return k
+
 # ---------- PREDICTIONS ----------
 def predict_linear(prices, steps=1):
     if len(prices)==0: return 0
