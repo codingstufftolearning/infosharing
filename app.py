@@ -2,31 +2,59 @@
 import streamlit as st
 import requests
 import pandas as pd
-import time  # <- FIX: needed for retries
+import time
 
 # ---------- CONFIG ----------
 coins = {
-    "Bitcoin": "bitcoin",
-    "Ethereum": "ethereum",
-    "Solana": "solana",
-    "BNB": "binancecoin",
-    "XRP": "ripple"
+    "Bitcoin": "BTCUSDT",
+    "Ethereum": "ETHUSDT",
+    "Solana": "SOLUSDT",
+    "BNB": "BNBUSDT",
+    "XRP": "XRPUSDT"
 }
 
 # ---------- FUNCTIONS ----------
-def get_price(coin, days, retries=3, wait=2):
-    """Fetch price history from CoinGecko with retry"""
-    url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
+def get_price_coingecko(coin_id, days, retries=3, wait=2):
+    """Fetch price from CoinGecko, return list of prices"""
+    cg_ids = {
+        "BTCUSDT": "bitcoin",
+        "ETHUSDT": "ethereum",
+        "SOLUSDT": "solana",
+        "BNBUSDT": "binancecoin",
+        "XRPUSDT": "ripple"
+    }
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_ids[coin_id]}/market_chart?vs_currency=usd&days={days}"
     for attempt in range(retries):
         try:
             data = requests.get(url, timeout=10).json()
             if "prices" in data and len(data["prices"]) > 0:
                 return [p[1] for p in data["prices"]]
-        except Exception as e:
-            st.warning(f"Attempt {attempt+1} failed for {coin}: {e}")
-        time.sleep(wait)
-    st.warning(f"No price data returned for {coin}. Using placeholder.")
-    return [0]  # fallback so app doesn’t crash
+        except:
+            time.sleep(wait)
+    return []
+
+def get_price_binance(symbol, interval='1h', limit=100, retries=3, wait=2):
+    """Fetch fallback price from Binance public API"""
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    for attempt in range(retries):
+        try:
+            data = requests.get(url, timeout=10).json()
+            if len(data) > 0:
+                return [float(item[4]) for item in data]  # closing prices
+        except:
+            time.sleep(wait)
+    return []
+
+def get_price(coin, days):
+    """Try CoinGecko first, fallback to Binance"""
+    prices = get_price_coingecko(coin, days)
+    if not prices:
+        st.warning(f"CoinGecko failed for {coin}, using Binance fallback")
+        prices = get_price_binance(coin, limit=days*24)  # approx hourly candles
+    if not prices:
+        st.warning(f"No price data available for {coin}, using placeholder")
+        prices = [0]
+    return prices
 
 def analyze(prices):
     """Simple trend analysis"""
@@ -41,12 +69,12 @@ def analyze(prices):
         return "Neutral ➡️", change
 
 # ---------- STREAMLIT UI ----------
-st.title("📊 Crypto Dashboard (CoinGecko Only)")
-st.write("Click the button to fetch multi-timeframe crypto analysis.")
+st.title("📊 Crypto Dashboard (Public Sources Only)")
+st.write("Click the button to fetch multi-timeframe crypto analysis using CoinGecko + Binance fallback.")
 
 if st.button("Analyze Market"):
-    for name, coin in coins.items():
-        st.subheader(name)
+    for coin in coins:
+        st.subheader(coin)
 
         # Fetch price data
         prices_30min = get_price(coin, 1)[-10:]   # last ~30 min
