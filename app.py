@@ -166,10 +166,13 @@ if st.button("Analyze Market"):
         if len(prices)==0: prices=[0]
         current = prices[-1]
         s = score(prices)
-        # Use correct steps for future horizons
+        # Smoothed predictions for 24h, 3d, 7d
         est1 = predict_combined(prices, steps=1)
         est3 = predict_combined(prices, steps=3)
         est7 = predict_combined(prices, steps=7)
+        # Optional smoothing: average of last 3 days for 3d, last 7 for 7d
+        est3 = (est3 + np.mean(prices[-3:]))/2
+        est7 = (est7 + np.mean(prices[-7:]))/2
         st.session_state.results.append({
             "Coin":name,
             "Price":round(current,2),
