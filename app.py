@@ -12,7 +12,10 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 # ---------- FIREBASE INIT ----------
-cred_dict = json.loads(st.secrets["FIREBASE_JSON"])  # Streamlit secret
+cred_dict = json.loads(st.secrets["FIREBASE_JSON"])
+
+# FIX: convert escaped newlines to real newlines
+cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
 cred = credentials.Certificate(cred_dict)
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
