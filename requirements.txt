@@ -7,3 +7,7 @@ beautifulsoup4
 lxml
 textblob
 firebase-admin
+vaderSentiment
+tensorflow
+keras
+plotly
