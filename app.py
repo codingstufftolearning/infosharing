@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
 from bs4 import BeautifulSoup
+from textblob import TextBlob
 
 # ---------- CONFIG ----------
 coins = {
@@ -102,26 +103,6 @@ def macd(prices):
 def momentum(prices):
     return prices[-1]-prices[-5] if len(prices)>5 else 0
 
-@st.cache_data(ttl=300)
-def bollinger_bands(prices, window=20):
-    if len(prices)<window:
-        return 0,0
-    s = pd.Series(prices)
-    ma = s.rolling(window).mean().iloc[-1]
-    std = s.rolling(window).std().iloc[-1]
-    upper = ma + 2*std
-    lower = ma - 2*std
-    return upper, lower
-
-@st.cache_data(ttl=300)
-def stochastic_oscillator(prices, k_period=14):
-    if len(prices)<k_period:
-        return 50
-    s = pd.Series(prices)
-    low_min = s.rolling(k_period).min().iloc[-1]
-    high_max = s.rolling(k_period).max().iloc[-1]
-    return 100*(s.iloc[-1]-low_min)/(high_max-low_min+0.0001)
-
 # ---------- PREDICTIONS ----------
 def predict_linear(prices, steps=1):
     if len(prices)==0: return 0
@@ -160,14 +141,14 @@ def get_crypto_news():
         html = requests.get(url, headers=HEADERS, timeout=10).text
         soup = BeautifulSoup(html, 'html.parser')
         headlines = [h.get_text(strip=True) for h in soup.find_all('h3')]
-        return headlines[:20]  # take latest 20
+        return headlines[:20]
     except:
         return []
 
 @st.cache_data(ttl=300)
-def simple_sentiment(texts):
-    positive = ["bull","rise","surge","gain","pump"]
-    negative = ["crash","drop","fall","hack","dump"]
+def keyword_sentiment(texts):
+    positive = ["bull","rise","surge","gain","pump","all-time high","moon","rally","soar"]
+    negative = ["crash","drop","fall","hack","dump","plunge","sell-off","bear"]
     score = 0
     for t in texts:
         t_lower = t.lower()
@@ -179,10 +160,23 @@ def simple_sentiment(texts):
                 score -= 1
     return score / len(texts) if texts else 0
 
+@st.cache_data(ttl=300)
+def polarity_sentiment(texts):
+    if not texts:
+        return 0
+    scores = [TextBlob(t).sentiment.polarity for t in texts]
+    return np.mean(scores)
+
+@st.cache_data(ttl=300)
+def combined_sentiment(texts):
+    ks = keyword_sentiment(texts)
+    ps = polarity_sentiment(texts)
+    return (ks + ps)/2
+
 # ---------- SIGNALS ----------
 def get_signal(current, est, sentiment=0):
     change_pct = (est - current)/current if current>0 else 0
-    combined_score = change_pct + sentiment*0.01  # weight sentiment
+    combined_score = change_pct + sentiment*0.01
     if combined_score > 0.03:
         return "🚀 Strong Buy"
     elif combined_score > 0:
@@ -200,10 +194,10 @@ st.title("📊 PRO Smart Crypto Dashboard")
 selected_coins = st.multiselect("Select coins to analyze", list(coins.keys()), default=list(coins.keys()))
 
 news_headlines = get_crypto_news()
-sentiment_score = simple_sentiment(news_headlines)
+sentiment_score = combined_sentiment(news_headlines)
 st.subheader("📰 Latest Crypto News Sentiment")
 st.write(f"Market Sentiment Score: {sentiment_score}")
-for h in news_headlines[:5]:  # show top 5 headlines
+for h in news_headlines[:5]:
     st.write(f"- {h}")
 
 if st.button("Analyze Market"):
@@ -214,16 +208,12 @@ if st.button("Analyze Market"):
         if len(prices)==0: prices=[0]
         current = prices[-1]
 
-        # Smoothed predictions
         est1 = predict_combined(prices, steps=1)
         est3 = (predict_combined(prices, steps=3) + np.mean(prices[-3:]))/2
         est7 = (predict_combined(prices, steps=7) + np.mean(prices[-7:]))/2
 
-        # Additional indicators
         upper, lower = bollinger_bands(prices)
         stoch = stochastic_oscillator(prices)
-
-        # Volatility
         volatility = np.std(prices)/np.mean(prices) if np.mean(prices)>0 else 0
 
         st.session_state.results.append({
