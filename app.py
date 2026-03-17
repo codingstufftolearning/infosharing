@@ -30,7 +30,7 @@ def safe_request(url):
     return None
 
 # ---------- DATA SOURCES ----------
-@st.cache_data(ttl=900)  # 15 min
+@st.cache_data(ttl=900)
 def get_price_cryptocompare(symbol, days):
     url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol}&tsym=USD&limit={days}"
     data = safe_request(url)
@@ -38,7 +38,7 @@ def get_price_cryptocompare(symbol, days):
         return [d.get("close",0) for d in data["Data"]["Data"] if isinstance(d, dict) and d.get("close",0)>0]
     return []
 
-@st.cache_data(ttl=900)  # 15 min
+@st.cache_data(ttl=900)
 def get_price_coingecko(cg_id, days):
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
     data = safe_request(url)
@@ -48,7 +48,7 @@ def get_price_coingecko(cg_id, days):
         return df.groupby('d')['p'].last().tolist()
     return []
 
-@st.cache_data(ttl=60)  # 1 min
+@st.cache_data(ttl=60)
 def get_current(symbol):
     data = safe_request(f"https://min-api.cryptocompare.com/data/price?fsym={symbol}&tsyms=USD")
     if data and "USD" in data:
@@ -83,10 +83,8 @@ def rsi(prices, period=14):
     delta = np.diff(prices)
     gain = np.maximum(delta,0)
     loss = -np.minimum(delta,0)
-    avg_gain = np.mean(gain[:period])
-    avg_loss = np.mean(loss[:period])
-    if avg_loss==0:
-        return 100
+    avg_gain = np.mean(gain[:period]) if len(gain[:period])>0 else 0
+    avg_loss = np.mean(loss[:period]) if len(loss[:period])>0 else 0.0001
     rs = avg_gain/avg_loss
     return 100-(100/(1+rs))
 
@@ -105,16 +103,19 @@ def momentum(prices):
 
 # ---------- PREDICTIONS ----------
 def predict_linear(prices, steps=1):
+    if len(prices)==0: return 0
     x = np.arange(len(prices))
     y = np.array(prices)
     slope, intercept = np.polyfit(x,y,1)
     return slope*(len(prices)+steps)+intercept
 
 def predict_ewma(prices, steps=1, span=10):
+    if len(prices)==0: return 0
     s = pd.Series(prices)
     return s.ewm(span=span).mean().iloc[-1]
 
 def predict_arima(prices, steps=1):
+    if len(prices)==0: return 0
     try:
         model = ARIMA(prices, order=(2,1,2))
         model_fit = model.fit()
@@ -124,13 +125,12 @@ def predict_arima(prices, steps=1):
         return prices[-1]
 
 def predict_combined(prices):
-    p1 = predict_linear(prices)
-    p2 = predict_ewma(prices)
-    p3 = predict_arima(prices)
-    return np.mean([p1,p2,p3])
+    return np.mean([predict_linear(prices), predict_ewma(prices), predict_arima(prices)])
 
 # ---------- SCORING ----------
 def score(prices):
+    if len(prices)==0 or np.mean(prices)==0:
+        return 0
     t = (prices[-1]-prices[0])/prices[0]
     r = rsi(prices)
     m = macd(prices)
@@ -159,6 +159,7 @@ if st.button("Analyze Market"):
     st.session_state.results=[]
     for name,c in coins.items():
         prices=get_price(c["symbol"],c["cg_id"])
+        if len(prices)==0: prices=[0]
         current = prices[-1]
         s = score(prices)
         est1 = predict_combined(prices)
@@ -167,9 +168,9 @@ if st.button("Analyze Market"):
         st.session_state.results.append({
             "Coin":name,
             "Price":round(current,2),
-            "24h %":round((est1-current)/current*100,2),
-            "3d %":round((est3-current)/current*100,2),
-            "7d %":round((est7-current)/current*100,2),
+            "24h %":round((est1-current)/current*100 if current>0 else 0,2),
+            "3d %":round((est3-current)/current*100 if current>0 else 0,2),
+            "7d %":round((est7-current)/current*100 if current>0 else 0,2),
             "Signal":label(s),
             "Score":s,
             "Prices":prices
