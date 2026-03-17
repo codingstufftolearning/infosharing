@@ -3,16 +3,15 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
-import yfinance as yf
 
 # ---------- CONFIG ----------
 coins = {
-    "Bitcoin": {"symbol": "BTC", "cg_id": "bitcoin", "yf": "BTC-USD"},
-    "Ethereum": {"symbol": "ETH", "cg_id": "ethereum", "yf": "ETH-USD"},
-    "Solana": {"symbol": "SOL", "cg_id": "solana", "yf": "SOL-USD"},
-    "Cardano": {"symbol": "ADA", "cg_id": "cardano", "yf": "ADA-USD"},
-    "Arbitrum": {"symbol": "ARB", "cg_id": "arbitrum", "yf": "ARB-USD"},
-    "Optimism": {"symbol": "OP", "cg_id": "optimism", "yf": "OP-USD"}
+    "Bitcoin": {"symbol": "BTC", "cg_id": "bitcoin"},
+    "Ethereum": {"symbol": "ETH", "cg_id": "ethereum"},
+    "Solana": {"symbol": "SOL", "cg_id": "solana"},
+    "Cardano": {"symbol": "ADA", "cg_id": "cardano"},
+    "Arbitrum": {"symbol": "ARB", "cg_id": "arbitrum"},
+    "Optimism": {"symbol": "OP", "cg_id": "optimism"}
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -65,16 +64,6 @@ def get_price_coingecko(cg_id, days):
         return df.groupby('d')['p'].last().tolist()
     return []
 
-@st.cache_data(ttl=300)
-def get_yf(ticker):
-    try:
-        data = yf.download(ticker, period="30d", interval="1d", progress=False)
-        if data is not None and not data.empty and "Close" in data:
-            return data["Close"].dropna().tolist()
-    except Exception as e:
-        print(f"Yahoo Finance error {ticker}: {e}")
-    return []
-
 @st.cache_data(ttl=120)
 def get_current(symbol):
     data = safe_request(f"https://min-api.cryptocompare.com/data/price?fsym={symbol}&tsyms=USD")
@@ -97,12 +86,10 @@ def merge_prices(*sources):
 
     return merged
 
-def get_price(symbol, cg_id, yf_ticker):
+def get_price(symbol, cg_id):
     cc = get_price_cryptocompare(symbol, 30)
     cg = get_price_coingecko(cg_id, 30)
-    yf_data = get_yf(yf_ticker)
-
-    merged = merge_prices(cc, cg, yf_data)
+    merged = merge_prices(cc, cg)
 
     if len(merged) < 5:
         current = get_current(symbol)
@@ -178,7 +165,7 @@ if st.button("Analyze Market"):
     results = []
 
     for name, c in coins.items():
-        prices = get_price(c["symbol"], c["cg_id"], c["yf"])
+        prices = get_price(c["symbol"], c["cg_id"])
         current = prices[-1]
 
         s = score(prices)
@@ -203,6 +190,6 @@ if st.button("Analyze Market"):
 
     if st.checkbox("Show charts"):
         for name, c in coins.items():
-            prices = get_price(c["symbol"], c["cg_id"], c["yf"])
+            prices = get_price(c["symbol"], c["cg_id"])
             st.subheader(name)
             st.line_chart(pd.DataFrame(prices, columns=["Price"]))
