@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
+from bs4 import BeautifulSoup
 
 # ---------- CONFIG ----------
 coins = {
@@ -101,7 +102,6 @@ def macd(prices):
 def momentum(prices):
     return prices[-1]-prices[-5] if len(prices)>5 else 0
 
-# Additional indicators
 @st.cache_data(ttl=300)
 def bollinger_bands(prices, window=20):
     if len(prices)<window:
@@ -152,16 +152,44 @@ def predict_combined(prices, steps=1):
         predict_arima(prices, steps)
     ])
 
-# ---------- SIGNALS BASED ON PREDICTION ----------
-def get_signal(current, est):
+# ---------- NEWS SYSTEM ----------
+@st.cache_data(ttl=600)
+def get_crypto_news():
+    url = "https://www.coingecko.com/en/news"
+    try:
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+        soup = BeautifulSoup(html, 'html.parser')
+        headlines = [h.get_text(strip=True) for h in soup.find_all('h3')]
+        return headlines[:20]  # take latest 20
+    except:
+        return []
+
+@st.cache_data(ttl=300)
+def simple_sentiment(texts):
+    positive = ["bull","rise","surge","gain","pump"]
+    negative = ["crash","drop","fall","hack","dump"]
+    score = 0
+    for t in texts:
+        t_lower = t.lower()
+        for w in positive:
+            if w in t_lower:
+                score += 1
+        for w in negative:
+            if w in t_lower:
+                score -= 1
+    return score / len(texts) if texts else 0
+
+# ---------- SIGNALS ----------
+def get_signal(current, est, sentiment=0):
     change_pct = (est - current)/current if current>0 else 0
-    if change_pct > 0.03:
+    combined_score = change_pct + sentiment*0.01  # weight sentiment
+    if combined_score > 0.03:
         return "🚀 Strong Buy"
-    elif change_pct > 0:
+    elif combined_score > 0:
         return "🟢 Buy"
-    elif change_pct > -0.02:
+    elif combined_score > -0.02:
         return "⚖️ Neutral"
-    elif change_pct > -0.05:
+    elif combined_score > -0.05:
         return "🟠 Sell"
     else:
         return "🔴 Strong Sell"
@@ -170,6 +198,13 @@ def get_signal(current, est):
 st.title("📊 PRO Smart Crypto Dashboard")
 
 selected_coins = st.multiselect("Select coins to analyze", list(coins.keys()), default=list(coins.keys()))
+
+news_headlines = get_crypto_news()
+sentiment_score = simple_sentiment(news_headlines)
+st.subheader("📰 Latest Crypto News Sentiment")
+st.write(f"Market Sentiment Score: {sentiment_score}")
+for h in news_headlines[:5]:  # show top 5 headlines
+    st.write(f"- {h}")
 
 if st.button("Analyze Market"):
     st.session_state.results=[]
@@ -188,7 +223,7 @@ if st.button("Analyze Market"):
         upper, lower = bollinger_bands(prices)
         stoch = stochastic_oscillator(prices)
 
-        # Confidence / volatility
+        # Volatility
         volatility = np.std(prices)/np.mean(prices) if np.mean(prices)>0 else 0
 
         st.session_state.results.append({
@@ -197,7 +232,7 @@ if st.button("Analyze Market"):
             "24h %":round((est1-current)/current*100 if current>0 else 0,2),
             "3d %":round((est3-current)/current*100 if current>0 else 0,2),
             "7d %":round((est7-current)/current*100 if current>0 else 0,2),
-            "Signal":get_signal(current, est1),
+            "Signal":get_signal(current, est1, sentiment_score),
             "Volatility":round(volatility*100,2),
             "Bollinger Upper":round(upper,2),
             "Bollinger Lower":round(lower,2),
