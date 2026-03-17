@@ -124,8 +124,12 @@ def predict_arima(prices, steps=1):
     except:
         return prices[-1]
 
-def predict_combined(prices):
-    return np.mean([predict_linear(prices), predict_ewma(prices), predict_arima(prices)])
+def predict_combined(prices, steps=1):
+    return np.mean([
+        predict_linear(prices, steps),
+        predict_ewma(prices, steps),
+        predict_arima(prices, steps)
+    ])
 
 # ---------- SCORING ----------
 def score(prices):
@@ -162,9 +166,10 @@ if st.button("Analyze Market"):
         if len(prices)==0: prices=[0]
         current = prices[-1]
         s = score(prices)
-        est1 = predict_combined(prices)
-        est3 = predict_combined(prices)
-        est7 = predict_combined(prices)
+        # Use correct steps for future horizons
+        est1 = predict_combined(prices, steps=1)
+        est3 = predict_combined(prices, steps=3)
+        est7 = predict_combined(prices, steps=7)
         st.session_state.results.append({
             "Coin":name,
             "Price":round(current,2),
