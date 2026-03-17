@@ -3,9 +3,9 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
+import numpy as np
 
 # ---------- CONFIG ----------
-# Mapping: Display name → Binance symbol & CoinGecko ID
 coins = {
     "Bitcoin": {"symbol": "BTCUSDT", "cg_id": "bitcoin"},
     "Ethereum": {"symbol": "ETHUSDT", "cg_id": "ethereum"},
@@ -15,8 +15,21 @@ coins = {
 }
 
 # ---------- FUNCTIONS ----------
+def get_current_price(coin_name):
+    cg_id = coins[coin_name]["cg_id"]
+    binance_symbol = coins[coin_name]["symbol"]
+    try:
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+        data = requests.get(url, timeout=10).json()
+        price = data[cg_id]['usd']
+        return price
+    except:
+        prices = get_price_binance(binance_symbol, interval='1m', limit=1)
+        if prices:
+            return prices[-1]
+    return 0
+
 def get_price_coingecko(cg_id, days, retries=3, wait=2):
-    """Fetch price from CoinGecko, return list of prices"""
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
     for attempt in range(retries):
         try:
@@ -28,44 +41,31 @@ def get_price_coingecko(cg_id, days, retries=3, wait=2):
     return []
 
 def get_price_binance(symbol, interval='1h', limit=100, retries=3, wait=2):
-    """Fetch fallback price from Binance public API"""
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     for attempt in range(retries):
         try:
             data = requests.get(url, timeout=10).json()
             if len(data) > 0:
-                return [float(item[4]) for item in data]  # closing prices
+                return [float(item[4]) for item in data]
         except:
             time.sleep(wait)
     return []
 
-def get_price(coin_name, days, short_interval=False):
-    """Fetch price: CoinGecko first, Binance fallback, supports short-term intervals"""
+def get_price(coin_name, days):
     cg_id = coins[coin_name]["cg_id"]
     binance_symbol = coins[coin_name]["symbol"]
-
-    # Try CoinGecko
     prices = get_price_coingecko(cg_id, days)
-    if short_interval:
-        prices = prices[-10:] if len(prices) >= 10 else prices
-
-    # Fallback to Binance
-    if not prices or all(p == 0 for p in prices):
+    if not prices:
         st.warning(f"CoinGecko failed for {coin_name}, using Binance fallback")
-        interval = '5m' if short_interval else '1h'
-        limit = 12 if short_interval else days*24
+        interval = '1h'
+        limit = days*24
         prices = get_price_binance(binance_symbol, interval=interval, limit=limit)
-        if short_interval:
-            prices = prices[-10:] if len(prices) >= 10 else prices
-
     if not prices:
         st.warning(f"No price data available for {coin_name}, using placeholder")
         prices = [0]
-
     return prices
 
 def analyze(prices):
-    """Simple trend analysis"""
     if len(prices) < 2 or all(p == 0 for p in prices):
         return "No Data", 0
     change = ((prices[-1] - prices[0]) / prices[0]) * 100
@@ -77,7 +77,6 @@ def analyze(prices):
         return "Neutral ➡️", change
 
 def final_signal(trends):
-    """Combine trends from multiple timeframes into a final signal"""
     scores = {"Bullish 📈": 1, "Neutral ➡️": 0, "Bearish 📉": -1, "No Data": 0}
     total = sum(scores[t] for t in trends)
     if total > 1:
@@ -87,41 +86,54 @@ def final_signal(trends):
     else:
         return "Overall Neutral ➡️"
 
+def estimate_next_price(prices):
+    if len(prices) < 2 or all(p == 0 for p in prices):
+        return 0
+    x = np.arange(len(prices))
+    y = np.array(prices)
+    slope, intercept = np.polyfit(x, y, 1)
+    return slope * (len(prices)) + intercept
+
 # ---------- STREAMLIT UI ----------
-st.title("📊 Crypto Dashboard (Public Sources Only)")
-st.write("Click the button to fetch multi-timeframe crypto analysis using CoinGecko + Binance fallback.")
+st.title("📊 Crypto Dashboard with Estimated Next Price")
+st.write("Shows current price, trend estimations, and simple next-price estimate with projected line.")
 
 if st.button("Analyze Market"):
     for name in coins:
         st.subheader(name)
+        # Current price
+        current_price = get_current_price(name)
+        st.markdown(f"**Current Price:** ${current_price:,.2f}")
 
-        # Fetch price data
-        prices_30min = get_price(name, 1, short_interval=True)  # last ~30 min
-        prices_1d     = get_price(name, 1)
-        prices_7d     = get_price(name, 7)
-        prices_30d    = get_price(name, 30)
+        # Historical prices
+        prices_1d  = get_price(name, 1)
+        prices_7d  = get_price(name, 7)
+        prices_30d = get_price(name, 30)
 
-        # Analyze trends
-        short = analyze(prices_30min)
+        # Trends
         day   = analyze(prices_1d)
         week  = analyze(prices_7d)
         month = analyze(prices_30d)
+        trends = [day[0], week[0], month[0]]
 
-        # Display trends
-        st.write(f"30 min: {short[0]} ({short[1]:.2f}%)")
-        st.write(f"24h: {day[0]} ({day[1]:.2f}%)")
-        st.write(f"7d: {week[0]} ({week[1]:.2f}%)")
-        st.write(f"30d: {month[0]} ({month[1]:.2f}%)")
-
-        # Final combined signal
-        trends = [short[0], day[0], week[0], month[0]]
+        st.write(f"24h Trend: {day[0]} ({day[1]:.2f}%)")
+        st.write(f"7d Trend: {week[0]} ({week[1]:.2f}%)")
+        st.write(f"30d Trend: {month[0]} ({month[1]:.2f}%)")
         st.markdown(f"**Final Estimation Signal:** {final_signal(trends)}")
 
-        # Chart for 7-day price
+        # Estimate next price
+        estimated_price = estimate_next_price(prices_7d)
+        if estimated_price > 0:
+            st.markdown(f"**Estimated Next Price (7d trend):** ${estimated_price:,.2f}")
+
+        # 7-day chart with projected next price
         if prices_7d and all(p > 0 for p in prices_7d):
             df = pd.DataFrame(prices_7d, columns=["Price"])
-            st.line_chart(df)
+            # Add projected next price as last point
+            df_proj = df.copy()
+            df_proj.loc[len(df)] = estimated_price
+            st.line_chart(df_proj)
         else:
-            st.write("No chart available due to missing price data.")
+            st.write("No chart available for 7-day price.")
 
         st.markdown("---")
