@@ -101,6 +101,27 @@ def macd(prices):
 def momentum(prices):
     return prices[-1]-prices[-5] if len(prices)>5 else 0
 
+# Additional indicators
+@st.cache_data(ttl=300)
+def bollinger_bands(prices, window=20):
+    if len(prices)<window:
+        return 0,0
+    s = pd.Series(prices)
+    ma = s.rolling(window).mean().iloc[-1]
+    std = s.rolling(window).std().iloc[-1]
+    upper = ma + 2*std
+    lower = ma - 2*std
+    return upper, lower
+
+@st.cache_data(ttl=300)
+def stochastic_oscillator(prices, k_period=14):
+    if len(prices)<k_period:
+        return 50
+    s = pd.Series(prices)
+    low_min = s.rolling(k_period).min().iloc[-1]
+    high_max = s.rolling(k_period).max().iloc[-1]
+    return 100*(s.iloc[-1]-low_min)/(high_max-low_min+0.0001)
+
 # ---------- PREDICTIONS ----------
 def predict_linear(prices, steps=1):
     if len(prices)==0: return 0
@@ -131,7 +152,7 @@ def predict_combined(prices, steps=1):
         predict_arima(prices, steps)
     ])
 
-# ---------- SCORING BASED ON FUTURE PREDICTION ----------
+# ---------- SIGNALS BASED ON PREDICTION ----------
 def get_signal(current, est):
     change_pct = (est - current)/current if current>0 else 0
     if change_pct > 0.03:
@@ -148,9 +169,12 @@ def get_signal(current, est):
 # ---------- UI ----------
 st.title("📊 PRO Smart Crypto Dashboard")
 
+selected_coins = st.multiselect("Select coins to analyze", list(coins.keys()), default=list(coins.keys()))
+
 if st.button("Analyze Market"):
     st.session_state.results=[]
-    for name,c in coins.items():
+    for name in selected_coins:
+        c = coins[name]
         prices=get_price(c["symbol"],c["cg_id"])
         if len(prices)==0: prices=[0]
         current = prices[-1]
@@ -160,6 +184,13 @@ if st.button("Analyze Market"):
         est3 = (predict_combined(prices, steps=3) + np.mean(prices[-3:]))/2
         est7 = (predict_combined(prices, steps=7) + np.mean(prices[-7:]))/2
 
+        # Additional indicators
+        upper, lower = bollinger_bands(prices)
+        stoch = stochastic_oscillator(prices)
+
+        # Confidence / volatility
+        volatility = np.std(prices)/np.mean(prices) if np.mean(prices)>0 else 0
+
         st.session_state.results.append({
             "Coin":name,
             "Price":round(current,2),
@@ -167,14 +198,17 @@ if st.button("Analyze Market"):
             "3d %":round((est3-current)/current*100 if current>0 else 0,2),
             "7d %":round((est7-current)/current*100 if current>0 else 0,2),
             "Signal":get_signal(current, est1),
-            "Score":round((est1-current)/current*100 if current>0 else 0,2),  # optional numeric score
+            "Volatility":round(volatility*100,2),
+            "Bollinger Upper":round(upper,2),
+            "Bollinger Lower":round(lower,2),
+            "Stochastic":round(stoch,2),
             "Prices":prices
         })
 
 if 'results' in st.session_state and st.session_state.results:
-    df = pd.DataFrame(st.session_state.results).sort_values(by="Score", ascending=False)
+    df = pd.DataFrame(st.session_state.results).sort_values(by="24h %", ascending=False)
     st.subheader("📊 Smart Market Table")
-    st.dataframe(df.drop(columns=["Score","Prices"]), use_container_width=True)
+    st.dataframe(df.drop(columns=["Prices"]), use_container_width=True)
 
     if st.checkbox("Show charts"):
         for coin in st.session_state.results:
