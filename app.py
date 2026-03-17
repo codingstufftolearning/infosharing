@@ -33,7 +33,6 @@ def safe_request(url):
 def get_price_cryptocompare(symbol, days):
     url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol}&tsym=USD&limit={days}"
     data = safe_request(url)
-
     if (
         data
         and isinstance(data, dict)
@@ -41,11 +40,7 @@ def get_price_cryptocompare(symbol, days):
         and "Data" in data
         and "Data" in data["Data"]
     ):
-        return [
-            d.get("close", 0)
-            for d in data["Data"]["Data"]
-            if isinstance(d, dict) and d.get("close", 0) > 0
-        ]
+        return [d.get("close",0) for d in data["Data"]["Data"] if isinstance(d, dict) and d.get("close",0)>0]
     return []
 
 @st.cache_data(ttl=300)
@@ -73,123 +68,112 @@ def get_current(symbol):
 
 # ---------- DATA FUSION ----------
 def merge_prices(*sources):
-    sources = [s for s in sources if len(s) > 0]
+    sources = [s for s in sources if len(s)>0]
     if not sources:
         return []
-
     min_len = min(len(s) for s in sources)
     trimmed = [s[-min_len:] for s in sources]
-
-    merged = []
-    for i in range(min_len):
-        merged.append(np.mean([s[i] for s in trimmed]))
-
+    merged = [np.mean([s[i] for s in trimmed]) for i in range(min_len)]
     return merged
 
 def get_price(symbol, cg_id):
-    cc = get_price_cryptocompare(symbol, 30)
-    cg = get_price_coingecko(cg_id, 30)
-    merged = merge_prices(cc, cg)
-
-    if len(merged) < 5:
+    cc = get_price_cryptocompare(symbol,30)
+    cg = get_price_coingecko(cg_id,30)
+    merged = merge_prices(cc,cg)
+    if len(merged)<5:
         current = get_current(symbol)
         return [current]*30
-
     return merged
 
 # ---------- INDICATORS ----------
 def rsi(prices, period=14):
-    if len(prices) < period:
+    if len(prices)<period:
         return 50
     delta = np.diff(prices)
-    gain = np.maximum(delta, 0)
-    loss = -np.minimum(delta, 0)
+    gain = np.maximum(delta,0)
+    loss = -np.minimum(delta,0)
     avg_gain = np.mean(gain[:period])
     avg_loss = np.mean(loss[:period])
-    if avg_loss == 0:
+    if avg_loss==0:
         return 100
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rs = avg_gain/avg_loss
+    return 100-(100/(1+rs))
 
 def macd(prices):
-    if len(prices) < 26:
+    if len(prices)<26:
         return 0
     s = pd.Series(prices)
-    macd = s.ewm(span=12).mean() - s.ewm(span=26).mean()
+    macd = s.ewm(span=12).mean()-s.ewm(span=26).mean()
     signal = macd.ewm(span=9).mean()
-    return macd.iloc[-1] - signal.iloc[-1]
+    return macd.iloc[-1]-signal.iloc[-1]
 
 def momentum(prices):
-    return prices[-1] - prices[-5] if len(prices) > 5 else 0
+    return prices[-1]-prices[-5] if len(prices)>5 else 0
 
 # ---------- PREDICTION ----------
 def predict(prices, steps):
     x = np.arange(len(prices))
     y = np.array(prices)
-    slope, intercept = np.polyfit(x, y, 1)
-    linear = slope * (len(prices)+steps) + intercept
+    slope, intercept = np.polyfit(x,y,1)
+    linear = slope*(len(prices)+steps)+intercept
     ma = np.mean(prices[-5:])
-    weights = np.linspace(1, 2, len(prices))
+    weights = np.linspace(1,2,len(prices))
     weighted = np.average(prices, weights=weights)
     return linear*0.5 + ma*0.3 + weighted*0.2
 
 # ---------- SCORING ----------
 def score(prices):
-    t = (prices[-1] - prices[0]) / prices[0]
+    t = (prices[-1]-prices[0])/prices[0]
     r = rsi(prices)
     m = macd(prices)
     mom = momentum(prices)
-    s = 0
-    if t > 0: s += 1
-    if r < 30: s += 1
-    if r > 70: s -= 1
-    if m > 0: s += 1
-    if m < 0: s -= 1
-    if mom > 0: s += 1
-    if mom < 0: s -= 1
+    s=0
+    if t>0: s+=1
+    if r<30: s+=1
+    if r>70: s-=1
+    if m>0: s+=1
+    if m<0: s-=1
+    if mom>0: s+=1
+    if mom<0: s-=1
     return s
 
 def label(score):
-    if score >= 3: return "🚀 Strong Buy"
-    elif score == 2: return "🟢 Buy"
-    elif score == 1: return "🟡 Weak Buy"
-    elif score == 0: return "⚖️ Neutral"
-    elif score == -1: return "🟠 Sell"
+    if score>=3: return "🚀 Strong Buy"
+    elif score==2: return "🟢 Buy"
+    elif score==1: return "🟡 Weak Buy"
+    elif score==0: return "⚖️ Neutral"
+    elif score==-1: return "🟠 Sell"
     else: return "🔴 Strong Sell"
 
 # ---------- UI ----------
 st.title("📊 PRO Smart Crypto Dashboard")
 
 if st.button("Analyze Market"):
-
-    results = []
-
-    for name, c in coins.items():
-        prices = get_price(c["symbol"], c["cg_id"])
+    st.session_state.results=[]
+    for name,c in coins.items():
+        prices=get_price(c["symbol"],c["cg_id"])
         current = prices[-1]
-
         s = score(prices)
-
-        est1 = predict(prices, 1)
-        est3 = predict(prices, 3)
-        est7 = predict(prices, 7)
-
-        results.append({
-            "Coin": name,
-            "Price": round(current, 2),
-            "24h %": round((est1-current)/current*100, 2),
-            "3d %": round((est3-current)/current*100, 2),
-            "7d %": round((est7-current)/current*100, 2),
-            "Signal": label(s),
-            "Score": s
+        est1 = predict(prices,1)
+        est3 = predict(prices,3)
+        est7 = predict(prices,7)
+        st.session_state.results.append({
+            "Coin":name,
+            "Price":round(current,2),
+            "24h %":round((est1-current)/current*100,2),
+            "3d %":round((est3-current)/current*100,2),
+            "7d %":round((est7-current)/current*100,2),
+            "Signal":label(s),
+            "Score":s,
+            "Prices":prices
         })
 
-    df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
+if 'results' in st.session_state and st.session_state.results:
+    df = pd.DataFrame(st.session_state.results).sort_values(by="Score", ascending=False)
     st.subheader("📊 Smart Market Table")
-    st.dataframe(df.drop(columns=["Score"]), use_container_width=True)
+    st.dataframe(df.drop(columns=["Score","Prices"]), use_container_width=True)
 
     if st.checkbox("Show charts"):
-        for name, c in coins.items():
-            prices = get_price(c["symbol"], c["cg_id"])
-            st.subheader(name)
-            st.line_chart(pd.DataFrame(prices, columns=["Price"]))
+        for coin in st.session_state.results:
+            st.subheader(coin["Coin"])
+            st.line_chart(pd.DataFrame(coin["Prices"], columns=["Price"]))
