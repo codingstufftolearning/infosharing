@@ -6,3 +6,4 @@ statsmodels
 beautifulsoup4
 lxml
 textblob
+firebase-admin
