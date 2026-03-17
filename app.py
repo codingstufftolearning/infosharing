@@ -39,19 +39,29 @@ def get_price_binance(symbol, interval='1h', limit=100, retries=3, wait=2):
             time.sleep(wait)
     return []
 
-def get_price(coin_name, days):
-    """Try CoinGecko first, fallback to Binance"""
+def get_price(coin_name, days, short_interval=False):
+    """Fetch price: CoinGecko first, Binance fallback, supports short-term intervals"""
     cg_id = coins[coin_name]["cg_id"]
     binance_symbol = coins[coin_name]["symbol"]
 
     # Try CoinGecko
     prices = get_price_coingecko(cg_id, days)
-    if not prices:
+    if short_interval:
+        prices = prices[-10:] if len(prices) >= 10 else prices
+
+    # Fallback to Binance
+    if not prices or all(p == 0 for p in prices):
         st.warning(f"CoinGecko failed for {coin_name}, using Binance fallback")
-        prices = get_price_binance(binance_symbol, limit=days*24)  # approx hourly candles
+        interval = '5m' if short_interval else '1h'
+        limit = 12 if short_interval else days*24
+        prices = get_price_binance(binance_symbol, interval=interval, limit=limit)
+        if short_interval:
+            prices = prices[-10:] if len(prices) >= 10 else prices
+
     if not prices:
         st.warning(f"No price data available for {coin_name}, using placeholder")
         prices = [0]
+
     return prices
 
 def analyze(prices):
@@ -86,15 +96,15 @@ if st.button("Analyze Market"):
         st.subheader(name)
 
         # Fetch price data
-        prices_30min = get_price(name, 1)[-10:]   # last ~30 min
-        prices_1d = get_price(name, 1)            # 24h
-        prices_7d = get_price(name, 7)            # 7d
-        prices_30d = get_price(name, 30)          # 30d
+        prices_30min = get_price(name, 1, short_interval=True)  # last ~30 min
+        prices_1d     = get_price(name, 1)
+        prices_7d     = get_price(name, 7)
+        prices_30d    = get_price(name, 30)
 
         # Analyze trends
         short = analyze(prices_30min)
-        day = analyze(prices_1d)
-        week = analyze(prices_7d)
+        day   = analyze(prices_1d)
+        week  = analyze(prices_7d)
         month = analyze(prices_30d)
 
         # Display trends
