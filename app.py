@@ -3,6 +3,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
 
 # ---------- CONFIG ----------
 coins = {
@@ -29,44 +30,32 @@ def safe_request(url):
     return None
 
 # ---------- DATA SOURCES ----------
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=900)  # 15 min
 def get_price_cryptocompare(symbol, days):
     url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol}&tsym=USD&limit={days}"
     data = safe_request(url)
-    if (
-        data
-        and isinstance(data, dict)
-        and data.get("Response") == "Success"
-        and "Data" in data
-        and "Data" in data["Data"]
-    ):
+    if data and isinstance(data, dict) and data.get("Response") == "Success" and "Data" in data and "Data" in data["Data"]:
         return [d.get("close",0) for d in data["Data"]["Data"] if isinstance(d, dict) and d.get("close",0)>0]
     return []
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=900)  # 15 min
 def get_price_coingecko(cg_id, days):
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
     data = safe_request(url)
-    if (
-        data
-        and isinstance(data, dict)
-        and "prices" in data
-        and isinstance(data["prices"], list)
-        and len(data["prices"]) > 0
-    ):
+    if data and isinstance(data, dict) and "prices" in data and isinstance(data["prices"], list) and len(data["prices"]) > 0:
         df = pd.DataFrame(data["prices"], columns=["t","p"])
         df['d'] = pd.to_datetime(df['t'], unit='ms').dt.date
         return df.groupby('d')['p'].last().tolist()
     return []
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=60)  # 1 min
 def get_current(symbol):
     data = safe_request(f"https://min-api.cryptocompare.com/data/price?fsym={symbol}&tsyms=USD")
     if data and "USD" in data:
         return data["USD"]
     return 0
 
-# ---------- DATA FUSION ----------
+@st.cache_data(ttl=900)
 def merge_prices(*sources):
     sources = [s for s in sources if len(s)>0]
     if not sources:
@@ -76,6 +65,7 @@ def merge_prices(*sources):
     merged = [np.mean([s[i] for s in trimmed]) for i in range(min_len)]
     return merged
 
+@st.cache_data(ttl=900)
 def get_price(symbol, cg_id):
     cc = get_price_cryptocompare(symbol,30)
     cg = get_price_coingecko(cg_id,30)
@@ -86,6 +76,7 @@ def get_price(symbol, cg_id):
     return merged
 
 # ---------- INDICATORS ----------
+@st.cache_data(ttl=300)
 def rsi(prices, period=14):
     if len(prices)<period:
         return 50
@@ -99,6 +90,7 @@ def rsi(prices, period=14):
     rs = avg_gain/avg_loss
     return 100-(100/(1+rs))
 
+@st.cache_data(ttl=300)
 def macd(prices):
     if len(prices)<26:
         return 0
@@ -107,19 +99,35 @@ def macd(prices):
     signal = macd.ewm(span=9).mean()
     return macd.iloc[-1]-signal.iloc[-1]
 
+@st.cache_data(ttl=300)
 def momentum(prices):
     return prices[-1]-prices[-5] if len(prices)>5 else 0
 
-# ---------- PREDICTION ----------
-def predict(prices, steps):
+# ---------- PREDICTIONS ----------
+def predict_linear(prices, steps=1):
     x = np.arange(len(prices))
     y = np.array(prices)
     slope, intercept = np.polyfit(x,y,1)
-    linear = slope*(len(prices)+steps)+intercept
-    ma = np.mean(prices[-5:])
-    weights = np.linspace(1,2,len(prices))
-    weighted = np.average(prices, weights=weights)
-    return linear*0.5 + ma*0.3 + weighted*0.2
+    return slope*(len(prices)+steps)+intercept
+
+def predict_ewma(prices, steps=1, span=10):
+    s = pd.Series(prices)
+    return s.ewm(span=span).mean().iloc[-1]
+
+def predict_arima(prices, steps=1):
+    try:
+        model = ARIMA(prices, order=(2,1,2))
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps)
+        return forecast[-1]
+    except:
+        return prices[-1]
+
+def predict_combined(prices):
+    p1 = predict_linear(prices)
+    p2 = predict_ewma(prices)
+    p3 = predict_arima(prices)
+    return np.mean([p1,p2,p3])
 
 # ---------- SCORING ----------
 def score(prices):
@@ -127,15 +135,14 @@ def score(prices):
     r = rsi(prices)
     m = macd(prices)
     mom = momentum(prices)
-    s=0
-    if t>0: s+=1
-    if r<30: s+=1
-    if r>70: s-=1
-    if m>0: s+=1
-    if m<0: s-=1
-    if mom>0: s+=1
-    if mom<0: s-=1
-    return s
+    volatility = np.std(prices)/np.mean(prices)
+    s = 0
+    s += 1.5 if t>0 else -1
+    s += 1 if r<30 else -1 if r>70 else 0
+    s += 1 if m>0 else -1 if m<0 else 0
+    s += 1 if mom>0 else -1
+    s -= volatility
+    return round(s)
 
 def label(score):
     if score>=3: return "🚀 Strong Buy"
@@ -154,9 +161,9 @@ if st.button("Analyze Market"):
         prices=get_price(c["symbol"],c["cg_id"])
         current = prices[-1]
         s = score(prices)
-        est1 = predict(prices,1)
-        est3 = predict(prices,3)
-        est7 = predict(prices,7)
+        est1 = predict_combined(prices)
+        est3 = predict_combined(prices)
+        est7 = predict_combined(prices)
         st.session_state.results.append({
             "Coin":name,
             "Price":round(current,2),
