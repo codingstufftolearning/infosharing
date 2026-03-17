@@ -4,3 +4,5 @@ numpy
 requests
 statsmodels
 beautifulsoup4
+lxml
+textblob
