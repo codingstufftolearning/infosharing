@@ -10,8 +10,7 @@ coins = {
     "Bitcoin": {"symbol": "BTCUSDT", "cg_id": "bitcoin", "cp_id": "btc-bitcoin"},
     "Ethereum": {"symbol": "ETHUSDT", "cg_id": "ethereum", "cp_id": "eth-ethereum"},
     "Solana": {"symbol": "SOLUSDT", "cg_id": "solana", "cp_id": "sol-solana"},
-    "BNB": {"symbol": "BNBUSDT", "cg_id": "binancecoin", "cp_id": "bnb-binance-coin"},
-    "XRP": {"symbol": "XRPUSDT", "cg_id": "ripple", "cp_id": "xrp-xrp"}
+    "Cardano": {"symbol": "ADAUSDT", "cg_id": "cardano", "cp_id": "ada-cardano"}
 }
 
 # ---------- FUNCTIONS ----------
@@ -69,7 +68,7 @@ def get_price_coinpaprika(cp_id, days, retries=3, wait=2):
                     return closes
         except:
             time.sleep(wait)
-    # Fallback: use current price repeated
+    # Only use current price fallback if all fail
     current = get_current_price_coinpaprika(cp_id)
     if current:
         return [current] * max(1, days)
@@ -89,21 +88,26 @@ def get_price(coin_name, days):
     binance_symbol = coins[coin_name]["symbol"]
     cp_id = coins[coin_name]["cp_id"]
 
-    # Try CoinGecko
+    # Try CoinPaprika first for historical (more reliable)
+    prices = get_price_coinpaprika(cp_id, days)
+    if prices and any(p != 0 for p in prices):
+        return prices
+
+    # Fallback to CoinGecko
     prices = get_price_coingecko(cg_id, days)
     if prices:
         return prices
 
-    # Binance fallback
+    # Fallback to Binance
     interval = '1h'
-    limit = days*24
+    limit = days * 24
     prices = get_price_binance(binance_symbol, interval=interval, limit=limit)
     if prices:
         return prices
 
-    # CoinPaprika fallback
-    prices = get_price_coinpaprika(cp_id, days)
-    return prices
+    # Last resort: fill with current price
+    current = get_current_price(coin_name)
+    return [current] * max(1, days)
 
 def get_current_price(coin_name):
     cg_id = coins[coin_name]["cg_id"]
@@ -152,7 +156,7 @@ def estimate_next_price(prices):
     return slope * (len(prices)) + intercept
 
 # ---------- STREAMLIT UI ----------
-st.title("📊 Crypto Dashboard with Robust Data Fetch")
+st.title("📊 Crypto Dashboard with ADA + Robust Data Fetch")
 st.write("Real-time price + historical data + trend estimation using multiple fallbacks.")
 
 if st.button("Analyze Market"):
@@ -180,7 +184,7 @@ if st.button("Analyze Market"):
         if estimated_price > 0:
             st.markdown(f"**Estimated Next Price (7d trend):** ${estimated_price:,.2f}")
 
-        if prices_7d and all(p > 0 for p in prices_7d):
+        if prices_7d and any(p != 0 for p in prices_7d):
             df = pd.DataFrame(prices_7d, columns=["Price"])
             df_proj = df.copy()
             df_proj.loc[len(df)] = estimated_price
