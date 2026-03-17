@@ -1,19 +1,35 @@
+# app.py
+import streamlit as st
 import requests
 import pandas as pd
-import matplotlib.pyplot as plt
 
+# ---------- CONFIG ----------
 coins = {
     "Bitcoin": "bitcoin",
     "Ethereum": "ethereum",
-    "Solana": "solana"
+    "Solana": "solana",
+    "BNB": "binancecoin",
+    "XRP": "ripple"
 }
 
+# ---------- FUNCTIONS ----------
 def get_price(coin, days):
+    """Fetch price history from CoinGecko"""
     url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
-    data = requests.get(url).json()
-    return [p[1] for p in data["prices"]]
+    try:
+        data = requests.get(url, timeout=10).json()
+        if "prices" not in data:
+            st.warning(f"No price data returned for {coin} (maybe API limit or offline)")
+            return []
+        return [p[1] for p in data["prices"]]
+    except Exception as e:
+        st.error(f"Error fetching price for {coin}: {e}")
+        return []
 
 def analyze(prices):
+    """Simple trend analysis"""
+    if len(prices) < 2:
+        return "No Data", 0
     change = ((prices[-1] - prices[0]) / prices[0]) * 100
     if change > 2:
         return "Bullish 📈", change
@@ -22,23 +38,37 @@ def analyze(prices):
     else:
         return "Neutral ➡️", change
 
-print("=== Crypto Analysis ===\n")
+# ---------- STREAMLIT UI ----------
+st.title("📊 Crypto Dashboard (CoinGecko Only)")
+st.write("Click the button to fetch multi-timeframe crypto analysis.")
 
-for name, coin in coins.items():
-    print(f"===== {name} =====")
+if st.button("Analyze Market"):
+    for name, coin in coins.items():
+        st.subheader(name)
 
-    prices_1d = get_price(coin, 1)
-    prices_7d = get_price(coin, 7)
+        # Fetch price data
+        prices_30min = get_price(coin, 1)[-10:]   # last ~30 min
+        prices_1d = get_price(coin, 1)            # 24h
+        prices_7d = get_price(coin, 7)            # 7d
+        prices_30d = get_price(coin, 30)          # 30d
 
-    short = analyze(prices_1d[-10:])
-    day = analyze(prices_1d)
-    week = analyze(prices_7d)
+        # Analyze trends
+        short = analyze(prices_30min)
+        day = analyze(prices_1d)
+        week = analyze(prices_7d)
+        month = analyze(prices_30d)
 
-    print(f"30 min: {short[0]} ({short[1]:.2f}%)")
-    print(f"24h: {day[0]} ({day[1]:.2f}%)")
-    print(f"7d: {week[0]} ({week[1]:.2f}%)\n")
+        # Display results
+        st.write(f"30 min: {short[0]} ({short[1]:.2f}%)")
+        st.write(f"24h: {day[0]} ({day[1]:.2f}%)")
+        st.write(f"7d: {week[0]} ({week[1]:.2f}%)")
+        st.write(f"30d: {month[0]} ({month[1]:.2f}%)")
 
-    # Chart
-    plt.plot(prices_7d)
-    plt.title(name + " (7 Days)")
-    plt.show()
+        # Chart for 7-day price
+        if prices_7d:
+            df = pd.DataFrame(prices_7d, columns=["Price"])
+            st.line_chart(df)
+        else:
+            st.write("No chart available due to missing price data.")
+
+        st.markdown("---")
