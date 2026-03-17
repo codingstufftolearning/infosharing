@@ -2,6 +2,7 @@
 import streamlit as st
 import requests
 import pandas as pd
+import time  # <- FIX: needed for retries
 
 # ---------- CONFIG ----------
 coins = {
@@ -66,7 +67,7 @@ if st.button("Analyze Market"):
         st.write(f"30d: {month[0]} ({month[1]:.2f}%)")
 
         # Chart for 7-day price
-        if prices_7d:
+        if prices_7d and all(p > 0 for p in prices_7d):
             df = pd.DataFrame(prices_7d, columns=["Price"])
             st.line_chart(df)
         else:
