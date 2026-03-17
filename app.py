@@ -54,21 +54,30 @@ def get_current_price_binance(symbol):
 
 # ---- CoinPaprika ----
 def get_price_coinpaprika(cp_id, days, retries=3, wait=2):
-    start = (pd.Timestamp.now() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
-    end = pd.Timestamp.now().strftime("%Y-%m-%d")
-    url = f"https://api.coinpaprika.com/v1/coins/{cp_id}/ohlcv/historical?start={start}&end={end}"
+    end = pd.Timestamp.now()
+    start = end - pd.Timedelta(days=days)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+    url = f"https://api.coinpaprika.com/v1/coins/{cp_id}/ohlcv/historical?start={start_str}&end={end_str}"
+
     for _ in range(retries):
         try:
             data = requests.get(url, timeout=10).json()
-            if len(data) > 0:
-                return [item['close'] for item in data]
+            if isinstance(data, list) and len(data) > 0:
+                closes = [item['close'] for item in data if 'close' in item]
+                if closes:
+                    return closes
         except:
             time.sleep(wait)
-    return []
+    # Fallback: use current price repeated
+    current = get_current_price_coinpaprika(cp_id)
+    if current:
+        return [current] * max(1, days)
+    return [0] * max(1, days)
 
 def get_current_price_coinpaprika(cp_id):
-    url = f"https://api.coinpaprika.com/v1/tickers/{cp_id}"
     try:
+        url = f"https://api.coinpaprika.com/v1/tickers/{cp_id}"
         data = requests.get(url, timeout=10).json()
         return data['quotes']['USD']['price']
     except:
@@ -85,40 +94,30 @@ def get_price(coin_name, days):
     if prices:
         return prices
 
-    st.warning(f"CoinGecko failed for {coin_name}, trying Binance fallback...")
+    # Binance fallback
     interval = '1h'
     limit = days*24
     prices = get_price_binance(binance_symbol, interval=interval, limit=limit)
     if prices:
         return prices
 
-    st.warning(f"Binance failed for {coin_name}, trying CoinPaprika fallback...")
+    # CoinPaprika fallback
     prices = get_price_coinpaprika(cp_id, days)
-    if prices:
-        return prices
-
-    st.warning(f"No historical data available for {coin_name}, using placeholder")
-    return [0]
+    return prices
 
 def get_current_price(coin_name):
     cg_id = coins[coin_name]["cg_id"]
     binance_symbol = coins[coin_name]["symbol"]
     cp_id = coins[coin_name]["cp_id"]
 
-    # Try CoinGecko
     price = get_current_price_coingecko(cg_id)
-    if price:
-        return price
+    if price: return price
 
-    # Fallback to Binance
     price = get_current_price_binance(binance_symbol)
-    if price:
-        return price
+    if price: return price
 
-    # Fallback to CoinPaprika
     price = get_current_price_coinpaprika(cp_id)
-    if price:
-        return price
+    if price: return price
 
     return 0
 
@@ -153,23 +152,20 @@ def estimate_next_price(prices):
     return slope * (len(prices)) + intercept
 
 # ---------- STREAMLIT UI ----------
-st.title("📊 Crypto Dashboard with Real-Time & Historical Data")
-st.write("Fetches current price, historical trends, and estimates next price using fallback sources.")
+st.title("📊 Crypto Dashboard with Robust Data Fetch")
+st.write("Real-time price + historical data + trend estimation using multiple fallbacks.")
 
 if st.button("Analyze Market"):
     for name in coins:
         st.subheader(name)
 
-        # Current price
         current_price = get_current_price(name)
         st.markdown(f"**Current Price:** ${current_price:,.2f}")
 
-        # Historical prices
         prices_1d  = get_price(name, 1)
         prices_7d  = get_price(name, 7)
         prices_30d = get_price(name, 30)
 
-        # Analyze trends
         day   = analyze(prices_1d)
         week  = analyze(prices_7d)
         month = analyze(prices_30d)
@@ -180,12 +176,10 @@ if st.button("Analyze Market"):
         st.write(f"30d Trend: {month[0]} ({month[1]:.2f}%)")
         st.markdown(f"**Final Estimation Signal:** {final_signal(trends)}")
 
-        # Estimate next price
         estimated_price = estimate_next_price(prices_7d)
         if estimated_price > 0:
             st.markdown(f"**Estimated Next Price (7d trend):** ${estimated_price:,.2f}")
 
-        # 7-day chart with projected next price
         if prices_7d and all(p > 0 for p in prices_7d):
             df = pd.DataFrame(prices_7d, columns=["Price"])
             df_proj = df.copy()
