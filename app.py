@@ -13,18 +13,19 @@ coins = {
 }
 
 # ---------- FUNCTIONS ----------
-def get_price(coin, days):
-    """Fetch price history from CoinGecko"""
+def get_price(coin, days, retries=3, wait=2):
+    """Fetch price history from CoinGecko with retry"""
     url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
-    try:
-        data = requests.get(url, timeout=10).json()
-        if "prices" not in data:
-            st.warning(f"No price data returned for {coin} (maybe API limit or offline)")
-            return []
-        return [p[1] for p in data["prices"]]
-    except Exception as e:
-        st.error(f"Error fetching price for {coin}: {e}")
-        return []
+    for attempt in range(retries):
+        try:
+            data = requests.get(url, timeout=10).json()
+            if "prices" in data and len(data["prices"]) > 0:
+                return [p[1] for p in data["prices"]]
+        except Exception as e:
+            st.warning(f"Attempt {attempt+1} failed for {coin}: {e}")
+        time.sleep(wait)
+    st.warning(f"No price data returned for {coin}. Using placeholder.")
+    return [0]  # fallback so app doesn’t crash
 
 def analyze(prices):
     """Simple trend analysis"""
