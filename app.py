@@ -3,204 +3,206 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import yfinance as yf
 
 # ---------- CONFIG ----------
 coins = {
-    "Bitcoin": {"symbol": "BTC", "cg_id": "bitcoin"},
-    "Ethereum": {"symbol": "ETH", "cg_id": "ethereum"},
-    "Solana": {"symbol": "SOL", "cg_id": "solana"},
-    "Cardano": {"symbol": "ADA", "cg_id": "cardano"},
-    "XAI": {"symbol": "XAI", "cg_id": "xai"},
-    "Arbitrum": {"symbol": "ARB", "cg_id": "arbitrum"},
-    "Optimism": {"symbol": "OP", "cg_id": "optimism"},
-    "PEPE": {"symbol": "PEPE", "cg_id": "pepe"}
+    "Bitcoin": {"symbol": "BTC", "cg_id": "bitcoin", "yf": "BTC-USD"},
+    "Ethereum": {"symbol": "ETH", "cg_id": "ethereum", "yf": "ETH-USD"},
+    "Solana": {"symbol": "SOL", "cg_id": "solana", "yf": "SOL-USD"},
+    "Cardano": {"symbol": "ADA", "cg_id": "cardano", "yf": "ADA-USD"},
+    "Arbitrum": {"symbol": "ARB", "cg_id": "arbitrum", "yf": "ARB-USD"},
+    "Optimism": {"symbol": "OP", "cg_id": "optimism", "yf": "OP-USD"}
 }
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ---------- REQUEST ----------
+# ---------- SAFE REQUEST ----------
 def safe_request(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code == 200:
             return r.json()
-    except:
-        pass
+        else:
+            print(f"HTTP {r.status_code}: {url}")
+    except Exception as e:
+        print(f"Error: {e}")
     return None
 
-# ---------- DATA ----------
+# ---------- DATA SOURCES ----------
 @st.cache_data(ttl=300)
 def get_price_cryptocompare(symbol, days):
     url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol}&tsym=USD&limit={days}"
     data = safe_request(url)
 
-    if data and "Data" in data:
-        return [d["close"] for d in data["Data"]["Data"] if d["close"] > 0]
-
+    if (
+        data
+        and isinstance(data, dict)
+        and data.get("Response") == "Success"
+        and "Data" in data
+        and "Data" in data["Data"]
+    ):
+        return [
+            d.get("close", 0)
+            for d in data["Data"]["Data"]
+            if isinstance(d, dict) and d.get("close", 0) > 0
+        ]
     return []
 
 @st.cache_data(ttl=300)
 def get_price_coingecko(cg_id, days):
     url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/market_chart?vs_currency=usd&days={days}"
     data = safe_request(url)
-
-    if data and "prices" in data:
+    if (
+        data
+        and isinstance(data, dict)
+        and "prices" in data
+        and isinstance(data["prices"], list)
+        and len(data["prices"]) > 0
+    ):
         df = pd.DataFrame(data["prices"], columns=["t","p"])
         df['d'] = pd.to_datetime(df['t'], unit='ms').dt.date
         return df.groupby('d')['p'].last().tolist()
+    return []
 
+@st.cache_data(ttl=300)
+def get_yf(ticker):
+    try:
+        data = yf.download(ticker, period="30d", interval="1d", progress=False)
+        if data is not None and not data.empty and "Close" in data:
+            return data["Close"].dropna().tolist()
+    except Exception as e:
+        print(f"Yahoo Finance error {ticker}: {e}")
     return []
 
 @st.cache_data(ttl=120)
-def get_current_price(symbol):
+def get_current(symbol):
     data = safe_request(f"https://min-api.cryptocompare.com/data/price?fsym={symbol}&tsyms=USD")
     if data and "USD" in data:
         return data["USD"]
     return 0
 
-# ---------- HELPERS ----------
-def fill_missing(prices, days):
-    if not prices:
+# ---------- DATA FUSION ----------
+def merge_prices(*sources):
+    sources = [s for s in sources if len(s) > 0]
+    if not sources:
         return []
-    while len(prices) < days:
-        prices.append(prices[-1])
-    return prices[:days]
 
-def generate_fake(current, days):
-    if current == 0:
-        return [0]*days
-    prices = []
-    for _ in range(days):
-        change = np.random.uniform(-0.02, 0.02)
-        current *= (1 + change)
-        prices.append(current)
-    return prices
+    min_len = min(len(s) for s in sources)
+    trimmed = [s[-min_len:] for s in sources]
 
-def get_price(symbol, cg_id, days):
-    prices = get_price_cryptocompare(symbol, days)
+    merged = []
+    for i in range(min_len):
+        merged.append(np.mean([s[i] for s in trimmed]))
 
-    if len(prices) < 2:
-        prices = get_price_coingecko(cg_id, days)
+    return merged
 
-    current = get_current_price(symbol)
+def get_price(symbol, cg_id, yf_ticker):
+    cc = get_price_cryptocompare(symbol, 30)
+    cg = get_price_coingecko(cg_id, 30)
+    yf_data = get_yf(yf_ticker)
 
-    if len(prices) < 2:
-        prices = generate_fake(current, days)
-    else:
-        prices = fill_missing(prices, days)
+    merged = merge_prices(cc, cg, yf_data)
 
-    return prices
+    if len(merged) < 5:
+        current = get_current(symbol)
+        return [current]*30
+
+    return merged
 
 # ---------- INDICATORS ----------
-def calculate_rsi(prices, period=14):
+def rsi(prices, period=14):
     if len(prices) < period:
         return 50
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
+    delta = np.diff(prices)
+    gain = np.maximum(delta, 0)
+    loss = -np.minimum(delta, 0)
+    avg_gain = np.mean(gain[:period])
+    avg_loss = np.mean(loss[:period])
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def calculate_macd(prices):
+def macd(prices):
     if len(prices) < 26:
         return 0
-    exp1 = pd.Series(prices).ewm(span=12).mean()
-    exp2 = pd.Series(prices).ewm(span=26).mean()
-    macd = exp1 - exp2
+    s = pd.Series(prices)
+    macd = s.ewm(span=12).mean() - s.ewm(span=26).mean()
     signal = macd.ewm(span=9).mean()
     return macd.iloc[-1] - signal.iloc[-1]
 
-def analyze(prices):
-    change = ((prices[-1]-prices[0])/prices[0])*100
-    if change > 2: return "Bullish", change
-    elif change < -2: return "Bearish", change
-    else: return "Neutral", change
+def momentum(prices):
+    return prices[-1] - prices[-5] if len(prices) > 5 else 0
 
-# ---------- SMART LOGIC ----------
-def smart_signal(trend, rsi, macd):
-    score = 0
+# ---------- PREDICTION ----------
+def predict(prices, steps):
+    x = np.arange(len(prices))
+    y = np.array(prices)
+    slope, intercept = np.polyfit(x, y, 1)
+    linear = slope * (len(prices)+steps) + intercept
+    ma = np.mean(prices[-5:])
+    weights = np.linspace(1, 2, len(prices))
+    weighted = np.average(prices, weights=weights)
+    return linear*0.5 + ma*0.3 + weighted*0.2
 
-    if trend == "Bullish": score += 1
-    if trend == "Bearish": score -= 1
+# ---------- SCORING ----------
+def score(prices):
+    t = (prices[-1] - prices[0]) / prices[0]
+    r = rsi(prices)
+    m = macd(prices)
+    mom = momentum(prices)
+    s = 0
+    if t > 0: s += 1
+    if r < 30: s += 1
+    if r > 70: s -= 1
+    if m > 0: s += 1
+    if m < 0: s -= 1
+    if mom > 0: s += 1
+    if mom < 0: s -= 1
+    return s
 
-    if rsi < 30: score += 1
-    elif rsi > 70: score -= 1
-
-    if macd > 0: score += 1
-    elif macd < 0: score -= 1
-
-    return score
-
-def score_to_label(score):
-    if score >= 2: return "🚀 Strong Buy"
-    elif score == 1: return "🟢 Buy"
+def label(score):
+    if score >= 3: return "🚀 Strong Buy"
+    elif score == 2: return "🟢 Buy"
+    elif score == 1: return "🟡 Weak Buy"
     elif score == 0: return "⚖️ Neutral"
     elif score == -1: return "🟠 Sell"
     else: return "🔴 Strong Sell"
 
-def confidence(score):
-    return int(min(100, abs(score) * 33 + 34))
-
-def estimate(prices, steps=1):
-    if len(prices) < 2:
-        return 0
-    x = np.arange(len(prices))
-    y = np.array(prices)
-    slope, intercept = np.polyfit(x, y, 1)
-    return slope * (len(prices)+steps) + intercept
-
 # ---------- UI ----------
-st.title("📊 Smart Crypto Dashboard")
+st.title("📊 PRO Smart Crypto Dashboard")
 
 if st.button("Analyze Market"):
 
     results = []
 
-    for name, data in coins.items():
-        symbol = data["symbol"]
-        cg_id = data["cg_id"]
+    for name, c in coins.items():
+        prices = get_price(c["symbol"], c["cg_id"], c["yf"])
+        current = prices[-1]
 
-        current = get_current_price(symbol)
-        prices = get_price(symbol, cg_id, 30)
+        s = score(prices)
 
-        trend, change = analyze(prices)
-        rsi = calculate_rsi(prices)
-        macd = calculate_macd(prices)
-
-        score = smart_signal(trend, rsi, macd)
-        label = score_to_label(score)
-        conf = confidence(score)
-
-        est1 = estimate(prices, 1)
-        est3 = estimate(prices, 3)
-        est7 = estimate(prices, 7)
+        est1 = predict(prices, 1)
+        est3 = predict(prices, 3)
+        est7 = predict(prices, 7)
 
         results.append({
             "Coin": name,
             "Price": round(current, 2),
-            "24h %": round((est1-current)/current*100, 2) if current else 0,
-            "3d %": round((est3-current)/current*100, 2) if current else 0,
-            "7d %": round((est7-current)/current*100, 2) if current else 0,
-            "Signal": label,
-            "Confidence": conf,
-            "Score": score
+            "24h %": round((est1-current)/current*100, 2),
+            "3d %": round((est3-current)/current*100, 2),
+            "7d %": round((est7-current)/current*100, 2),
+            "Signal": label(s),
+            "Score": s
         })
 
-    df = pd.DataFrame(results)
-
-    # Rank best coins
-    df = df.sort_values(by=["Score", "Confidence"], ascending=False)
-
-    st.subheader("📊 Market Summary")
+    df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
+    st.subheader("📊 Smart Market Table")
     st.dataframe(df.drop(columns=["Score"]), use_container_width=True)
 
-    # Optional charts
     if st.checkbox("Show charts"):
-        for name, data in coins.items():
-            prices = get_price(data["symbol"], data["cg_id"], 30)
+        for name, c in coins.items():
+            prices = get_price(c["symbol"], c["cg_id"], c["yf"])
             st.subheader(name)
             st.line_chart(pd.DataFrame(prices, columns=["Price"]))
