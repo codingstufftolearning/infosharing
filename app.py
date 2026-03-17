@@ -22,7 +22,11 @@ def get_price_coingecko(cg_id, days, retries=3, wait=2):
         try:
             data = requests.get(url, timeout=10).json()
             if "prices" in data and len(data["prices"]) > 0:
-                return [p[1] for p in data["prices"]]
+                # Take daily closing price by picking last price of each day
+                df = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
+                df['date'] = pd.to_datetime(df['timestamp'], unit='ms').dt.date
+                daily_prices = df.groupby('date')['price'].last().tolist()
+                return daily_prices[-days:]  # ensure correct number of days
         except:
             time.sleep(wait)
     return []
@@ -36,7 +40,7 @@ def get_current_price_coingecko(cg_id):
         return None
 
 # ---- Binance ----
-def get_price_binance(symbol, interval='1h', limit=100, retries=3, wait=2):
+def get_price_binance(symbol, interval='1d', limit=100, retries=3, wait=2):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     for _ in range(retries):
         try:
@@ -65,7 +69,7 @@ def get_price_coinpaprika(cp_id, days, retries=3, wait=2):
             if isinstance(data, list) and len(data) > 0:
                 closes = [item['close'] for item in data if 'close' in item]
                 if closes:
-                    return closes
+                    return closes[-days:]  # last 'days' values
         except:
             time.sleep(wait)
     return []  # let fallback handle
@@ -78,32 +82,43 @@ def get_current_price_coinpaprika(cp_id):
     except:
         return None
 
-# ---- Unified price fetch ----
+# ---- Unified historical fetch with multi-source fallback ----
 def get_price(coin_name, days):
     cg_id = coins[coin_name]["cg_id"]
     binance_symbol = coins[coin_name]["symbol"]
     cp_id = coins[coin_name]["cp_id"]
 
-    # 1️⃣ Try CoinPaprika historical
-    prices = get_price_coinpaprika(cp_id, days)
-    if prices:
-        return prices
+    prices = []
 
-    # 2️⃣ Try CoinGecko
-    prices = get_price_coingecko(cg_id, days)
-    if prices:
-        return prices
+    # 1️⃣ CoinPaprika
+    cp_prices = get_price_coinpaprika(cp_id, days)
+    if cp_prices:
+        prices = cp_prices
 
-    # 3️⃣ Try Binance
-    interval = '1h'
-    limit = days*24
-    prices = get_price_binance(binance_symbol, interval=interval, limit=limit)
-    if prices:
-        return prices
+    # 2️⃣ CoinGecko fill missing days
+    if len(prices) < days:
+        cg_prices = get_price_coingecko(cg_id, days)
+        for i in range(days):
+            if i < len(prices):
+                continue
+            if i < len(cg_prices):
+                prices.append(cg_prices[i])
+
+    # 3️⃣ Binance fill remaining missing
+    if len(prices) < days:
+        bin_prices = get_price_binance(binance_symbol, interval='1d', limit=days)
+        for i in range(days):
+            if i < len(prices):
+                continue
+            if i < len(bin_prices):
+                prices.append(bin_prices[i])
 
     # 4️⃣ Last resort: fill with current price
     current = get_current_price(coin_name)
-    return [current] * max(1, days)
+    while len(prices) < days:
+        prices.append(current)
+
+    return prices
 
 def get_current_price(coin_name):
     cg_id = coins[coin_name]["cg_id"]
@@ -112,13 +127,10 @@ def get_current_price(coin_name):
 
     price = get_current_price_coingecko(cg_id)
     if price: return price
-
     price = get_current_price_binance(binance_symbol)
     if price: return price
-
     price = get_current_price_coinpaprika(cp_id)
     if price: return price
-
     return 0
 
 # ---- Analysis & Estimation ----
@@ -152,8 +164,8 @@ def estimate_next_price(prices):
     return slope * (len(prices)) + intercept
 
 # ---------- STREAMLIT UI ----------
-st.title("📊 Crypto Dashboard with ADA + Robust Data Fetch")
-st.write("Real-time price + historical data + trend estimation using multiple fallbacks.")
+st.title("📊 Crypto Dashboard with ADA + Robust Free Historical Data")
+st.write("Real-time price + historical data + trend estimation using multiple free APIs.")
 
 if st.button("Analyze Market"):
     for name in coins:
