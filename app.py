@@ -8,21 +8,23 @@ from datetime import datetime, timedelta
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from statsmodels.tsa.arima.model import ARIMA
+import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, db
 
-# ---------------------------
-# 🔐 FIREBASE INIT (FROM SECRETS)
-# ---------------------------
-if not firebase_admin._apps:
+firebase_admin_initialized = False
+try:
     firebase_dict = dict(st.secrets["firebase"])
-    # Fix private_key newlines
     firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
     cred = credentials.Certificate(firebase_dict)
     firebase_admin.initialize_app(cred, {
         "databaseURL": firebase_dict["databaseURL"]
     })
-
+    firebase_admin_initialized = True
+except Exception as e:
+    st.error(f"Firebase init failed: {type(e).__name__}: {e}")
+    import traceback
+    st.text(traceback.format_exc())
 # ---------------------------
 # 📊 FETCH PRICE DATA (BINANCE + FALLBACK)
 # ---------------------------
