@@ -28,25 +28,15 @@ if not firebase_admin._apps:
 # ---------------------------
 # 🔧 Config
 # ---------------------------
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD","SOLUSDT"]
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XAIUSD","XRPUSDT","DOGEUSDT","LUNAUSDT","MATICUSDT"]
 TIMEFRAMES = {"1 Day":1,"3 Days":3,"5 Days":5,"1 Month":30}
 RSI_PERIOD = 14
 ARIMA_ORDER = (2,1,2)
-ROLLING_HOURS = 7*24  # last 7 days for indicators
+ROLLING_HOURS = 7*24
 
 # ---------------------------
-# 📊 Data Fetching with Caching
+# 📊 Data Fetching
 # ---------------------------
-@st.cache_data(ttl=600)
-def fetch_usdt_idr_rate():
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=idr"
-        data = requests.get(url, timeout=5).json()
-        rate = data.get("tether", {}).get("idr", None)
-        return round(rate,2) if rate else None
-    except:
-        return None
-
 @st.cache_data(ttl=600)
 def fetch_historical(symbol="BTCUSDT", days=30):
     prices, dates = [], []
@@ -60,7 +50,6 @@ def fetch_historical(symbol="BTCUSDT", days=30):
             return np.array(prices), dates
     except:
         pass
-    # API fallback
     coin = symbol.replace("USDT","").lower()
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
@@ -90,7 +79,7 @@ def fetch_hourly(symbol="BTCUSDT", hours=72):
         return np.array([]), []
 
 # ---------------------------
-# 📈 Technical Indicators
+# 📈 Indicators
 # ---------------------------
 def calculate_rsi(prices, period=RSI_PERIOD):
     delta = np.diff(prices)
@@ -110,7 +99,7 @@ def calculate_macd(prices):
     return macd.values, signal.values
 
 # ---------------------------
-# 📰 Sentiment Analysis
+# 📰 Sentiment
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_sentiment():
@@ -155,7 +144,7 @@ def hybrid_forecast(prices, dates, steps=1):
     return combined, upper, lower
 
 # ---------------------------
-# 🧠 Smart Signal & Weights
+# 🧠 Signals
 # ---------------------------
 def load_weights():
     ref=db.reference("weights")
@@ -222,31 +211,25 @@ def calculate_confidence(upper, lower, last_price):
 # ---------------------------
 # 🎨 Streamlit UI
 # ---------------------------
-st.title("🚀 AI Crypto Dashboard + Live USDT→IDR")
+st.title("🚀 AI Crypto Dashboard")
 
-usdt_idr = fetch_usdt_idr_rate()
-if usdt_idr:
-    st.metric("USDT → IDR", usdt_idr)
-else:
-    st.warning("Failed to fetch USDT → IDR rate")
+# Portfolio Input Collapsible
+st.subheader("💰 Portfolio Tracker (Optional)")
+portfolio = {}
+portfolio_buy = {}
+with st.expander("Enter Holdings & Buy Price"):
+    for coin in COINS:
+        portfolio[coin] = st.number_input(f"Holdings for {coin}", min_value=0.0, step=0.01, key=f"hold_{coin}")
+        portfolio_buy[coin] = st.number_input(f"Buy Price for {coin}", min_value=0.0, step=0.01, key=f"buy_{coin}")
 
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT"])
 timeframe = st.selectbox("Select Timeframe", list(TIMEFRAMES.keys()))
 
-# Optional Portfolio
-st.subheader("💰 Portfolio Tracker (Optional)")
-portfolio = {}
-for coin in symbols:
-    portfolio[coin] = st.number_input(f"Enter holdings for {coin}", min_value=0.0, step=0.01, key=f"hold_{coin}")
-
-# Helper: color-coded table
+# Color functions
 def apply_colors(val):
-    if val == "BUY":
-        return "background-color: #b6fcb6; color: black"
-    elif val == "SELL":
-        return "background-color: #fcb6b6; color: black"
-    elif val == "HOLD":
-        return "background-color: #fff79a; color: black"
+    if val == "BUY": return "background-color: #b6fcb6; color: black"
+    elif val == "SELL": return "background-color: #fcb6b6; color: black"
+    elif val == "HOLD": return "background-color: #fff79a; color: black"
     try:
         num = float(val)
         if num > 0: return "color: green"
@@ -254,20 +237,22 @@ def apply_colors(val):
     except: pass
     return ""
 
-# Metric Tooltips
 def metric_with_tooltip(name, value, tooltip):
     st.markdown(f"<span title='{tooltip}'>{name}: {value}</span>", unsafe_allow_html=True)
 
+# ---------------------------
+# Analyze Button
+# ---------------------------
 if st.button("Analyze"):
     with st.spinner("Analyzing coins..."):
         summary_data=[]
+        coin_details=[]
         for sym in symbols:
             prices, dates = fetch_historical(sym)
             hr_prices, hr_dates = fetch_hourly(sym)
             if len(hr_prices)>0:
                 prices=np.concatenate([prices, hr_prices])
                 dates=dates+hr_dates
-
             cutoff = datetime.utcnow() - timedelta(days=TIMEFRAMES[timeframe])
             fp = [p for d,p in zip(dates,prices) if d>=cutoff]
             fd = [d for d in dates if d>=cutoff]
@@ -276,7 +261,7 @@ if st.button("Analyze"):
             # Forecast
             next_p, upper, lower = hybrid_forecast(fp, fd, 1)
 
-            # Indicators & sentiment
+            # Indicators
             recent_prices = fp[-ROLLING_HOURS:] if len(fp)>ROLLING_HOURS else fp
             rsi = calculate_rsi(recent_prices)
             macd_v, sig_line = calculate_macd(recent_prices)
@@ -295,6 +280,7 @@ if st.button("Analyze"):
             current_price = fp[-1]
             confidence = calculate_confidence(upper, lower, current_price)
             portfolio_value = portfolio[sym]*current_price if sym in portfolio else 0
+            profit_loss = portfolio_value - (portfolio[sym]*portfolio_buy[sym]) if sym in portfolio else 0
 
             summary_data.append({
                 "Coin": sym,
@@ -304,24 +290,18 @@ if st.button("Analyze"):
                 "Win Rate (%)": win_rate,
                 "Change (%)": round(change_pct,2),
                 "Confidence (%)": confidence,
-                "Portfolio Value": round(portfolio_value,2)
+                "Portfolio Value": round(portfolio_value,2),
+                "P/L": round(profit_loss,2)
             })
 
-            # Plot with hover info
+            # Plot
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=fd,
                 y=fp,
                 mode='lines+markers',
                 name='Actual',
-                hovertemplate=
-                    "<b>Date:</b> %{x}<br>"+
-                    "<b>Price:</b> %{y}<br>"+
-                    "<b>RSI:</b> %{customdata[0]:.2f}<br>"+
-                    "<b>MACD:</b> %{customdata[1]:.2f}<br>"+
-                    "<b>Signal Line:</b> %{customdata[2]:.2f}<br>"+
-                    "<extra></extra>",
-                customdata=np.column_stack([rsi[-len(fp):], macd_v[-len(fp):], sig_line[-len(fp):]])
+                hovertemplate="<b>Date:</b> %{x}<br><b>Price:</b> %{y}<br><extra></extra>"
             ))
             fig.add_trace(go.Scatter(
                 x=[fd[-1], fd[-1]+timedelta(days=1)],
@@ -329,63 +309,49 @@ if st.button("Analyze"):
                 mode='lines+markers',
                 name='Forecast',
                 line=dict(dash='dash', color='red'),
-                hovertemplate=
-                    "<b>Date:</b> %{x}<br>"+
-                    "<b>Predicted Price:</b> %{y}<br>"+
-                    "<b>Sentiment:</b> "+str(round(sentiment,2))+"<br>"+
-                    "<b>Confidence:</b> "+str(confidence)+"%<br>"+
-                    "<extra></extra>"
-            ))
-            fig.add_trace(go.Scatter(
-                x=[fd[-1], fd[-1]+timedelta(days=1)],
-                y=[upper[0], upper[0]],
-                mode='lines',
-                line=dict(dash='dot', color='orange'),
-                name='Upper',
-                hoverinfo='skip'
-            ))
-            fig.add_trace(go.Scatter(
-                x=[fd[-1], fd[-1]+timedelta(days=1)],
-                y=[lower[0], lower[0]],
-                mode='lines',
-                line=dict(dash='dot', color='orange'),
-                name='Lower',
-                hoverinfo='skip'
+                hovertemplate=f"<b>Predicted:</b> {{y}}<br><b>Confidence:</b> {confidence}%<extra></extra>"
             ))
 
-            # Boxed Layout for Coin
+            coin_details.append((sym, fig, current_price, sig, score, win_rate, change_pct, confidence, portfolio_value, profit_loss))
+
+        # ---------------------------
+        # Summary Table at Top
+        # ---------------------------
+        if summary_data:
+            st.subheader("📊 Summary Table")
+            df_summary = pd.DataFrame(summary_data)
+            st.dataframe(df_summary.style.applymap(apply_colors))
+
+        # ---------------------------
+        # Per-Coin Charts & Stats
+        # ---------------------------
+        for (sym, fig, current_price, sig, score, win_rate, change_pct, confidence, portfolio_value, profit_loss) in coin_details:
             with st.container():
-                st.markdown(
-                    f"""
+                st.markdown(f"""
                     <div style="
-                        border: 2px solid #ccc; 
-                        border-radius: 10px; 
-                        padding: 15px; 
-                        margin-bottom: 20px;
-                        background-color: #f9f9f9;">
+                        border:1px solid #ccc;
+                        border-radius:10px;
+                        padding:15px;
+                        margin-bottom:15px;
+                        background-color:#f7f7f7;">
                         <h3 style='margin-bottom:10px'>{sym}</h3>
-                    """, unsafe_allow_html=True
-                )
-
-                col1, col2 = st.columns([3, 1])
+                    """, unsafe_allow_html=True)
+                col1, col2 = st.columns([3,1])
                 with col1:
                     st.subheader("Price Chart")
                     st.plotly_chart(fig, use_container_width=True)
                 with col2:
                     st.subheader("Statistics")
-                    metric_with_tooltip("Current Price", round(current_price,2), "Latest fetched price")
-                    metric_with_tooltip("Signal", sig, "AI BUY/SELL/HOLD recommendation")
-                    metric_with_tooltip("Score", round(score,2), "Weighted sum of indicators")
-                    metric_with_tooltip("Win Rate (%)", win_rate, "Historical accuracy of past signals")
-                    metric_with_tooltip("Change (%)", round(change_pct,2), "Price change over selected timeframe")
-                    metric_with_tooltip("Confidence (%)", confidence, "Model confidence based on forecast interval")
+                    metric_with_tooltip("Current Price", round(current_price,2), "Latest price")
+                    metric_with_tooltip("Signal", sig, "BUY/SELL/HOLD")
+                    metric_with_tooltip("Score", round(score,2), "Weighted indicator score")
+                    metric_with_tooltip("Win Rate (%)", win_rate, "Historical signal accuracy")
+                    metric_with_tooltip("Change (%)", round(change_pct,2), "Price change in timeframe")
+                    metric_with_tooltip("Confidence (%)", confidence, "Forecast confidence")
                     if portfolio[sym]>0:
-                        metric_with_tooltip("Portfolio Value", round(portfolio_value,2), f"Holdings: {portfolio[sym]} × Price")
-
+                        with st.expander("Portfolio Info"):
+                            metric_with_tooltip("Holdings", portfolio[sym], "Number of coins held")
+                            metric_with_tooltip("Buy Price", portfolio_buy[sym], "Price purchased")
+                            metric_with_tooltip("Current Value", round(portfolio_value,2), "Current value of holdings")
+                            metric_with_tooltip("Profit/Loss", round(profit_loss,2), "Current P/L")
                 st.markdown("</div>", unsafe_allow_html=True)
-
-        # Summary Table
-        if summary_data:
-            st.subheader("📊 Summary Table")
-            df_summary = pd.DataFrame(summary_data)
-            st.dataframe(df_summary.style.applymap(apply_colors))
