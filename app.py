@@ -32,37 +32,78 @@ if not firebase_admin._apps:
 def get_price_data(symbol="BTCUSDT", limit=30):
     prices, dates = [], []
 
-    # Binance API
+    # Map symbols for APIs
+    symbol_map = {
+        "BTCUSDT": "bitcoin",
+        "ETHUSDT": "ethereum",
+        "BNBUSDT": "binancecoin",
+        "ADAUSDT": "cardano"
+    }
+
+    base_symbol = symbol.replace("USDT", "")
+    coin_id = symbol_map.get(symbol, base_symbol.lower())
+
+    # ---------------------------
+    # 1. COINGECKO (FIXED)
+    # ---------------------------
     try:
-        url_binance = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit={limit}"
-        res = requests.get(url_binance, timeout=5)
-        data_binance = res.json()
-        if isinstance(data_binance, list) and len(data_binance) > 0:
-            prices = [float(x[4]) for x in data_binance]
-            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_binance]
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={limit}"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+
+        if "prices" in data and len(data["prices"]) > 0:
+            prices = [x[1] for x in data["prices"]]
+            dates = [datetime.fromtimestamp(x[0]/1000) for x in data["prices"]]
             return np.array(prices), dates
         else:
-            st.warning(f"Binance returned unexpected data for {symbol}: {data_binance}")
+            st.warning(f"CoinGecko failed: {data}")
     except Exception as e:
-        st.warning(f"Binance fetch failed for {symbol}: {e}")
+        st.warning(f"CoinGecko error: {e}")
 
-    # CoinGecko fallback
+    # ---------------------------
+    # 2. COINCAP
+    # ---------------------------
     try:
-        coin = symbol.replace("USDT","").lower()
-        url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={limit}"
-        res = requests.get(url_cg, timeout=5)
-        data_cg = res.json()
-        if "prices" in data_cg and len(data_cg["prices"]) > 0:
-            prices = [x[1] for x in data_cg["prices"]]
-            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg["prices"]]
+        url = f"https://api.coincap.io/v2/assets/{base_symbol.lower()}/history?interval=d1"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+
+        if "data" in data and len(data["data"]) > 0:
+            prices = [float(x["priceUsd"]) for x in data["data"][-limit:]]
+            dates = [datetime.fromtimestamp(x["time"]/1000) for x in data["data"][-limit:]]
             return np.array(prices), dates
         else:
-            st.warning(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
+            st.warning(f"CoinCap failed: {data}")
     except Exception as e:
-        st.warning(f"CoinGecko fetch failed for {symbol}: {e}")
+        st.warning(f"CoinCap error: {e}")
 
-    st.error(f"Failed to fetch price data for {symbol}.")
-    return np.array([]), []
+    # ---------------------------
+    # 3. CRYPTOCOMPARE
+    # ---------------------------
+    try:
+        url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={base_symbol}&tsym=USD&limit={limit}"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+
+        if "Data" in data and "Data" in data["Data"]:
+            prices = [x["close"] for x in data["Data"]["Data"]]
+            dates = [datetime.fromtimestamp(x["time"]) for x in data["Data"]["Data"]]
+            return np.array(prices), dates
+        else:
+            st.warning(f"CryptoCompare failed: {data}")
+    except Exception as e:
+        st.warning(f"CryptoCompare error: {e}")
+
+    # ---------------------------
+    # 4. LAST FALLBACK (FAKE SAFE DATA)
+    # ---------------------------
+    st.error(f"All APIs failed for {symbol}. Using synthetic data.")
+
+    # Generate fallback synthetic data (so app doesn't break)
+    dates = [datetime.utcnow() - timedelta(days=i) for i in range(limit)][::-1]
+    prices = np.linspace(100, 110, limit) + np.random.normal(0, 2, limit)
+
+    return np.array(prices), dates
 
 # ---------------------------
 # 📈 INDICATORS
