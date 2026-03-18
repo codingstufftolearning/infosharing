@@ -1,4 +1,3 @@
-# 🚀 AI Crypto Trading Bot (Full Version, Expanded)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,29 +11,15 @@ from prophet import Prophet
 import firebase_admin
 from firebase_admin import credentials, db
 
-# ---------------------------
-# 🔐 FIREBASE INIT
-# ---------------------------
 if not firebase_admin._apps:
-    try:
-        firebase_dict = dict(st.secrets["firebase"])
-        firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
-        cred = credentials.Certificate(firebase_dict)
-        firebase_admin.initialize_app(cred, {
-            "databaseURL": firebase_dict["databaseURL"]
-        })
-    except Exception as e:
-        st.error(f"Firebase Initialization Error: {type(e).__name__}: {e}")
+    firebase_dict = dict(st.secrets["firebase"])
+    firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
+    cred = credentials.Certificate(firebase_dict)
+    firebase_admin.initialize_app(cred, {"databaseURL": firebase_dict["databaseURL"]})
 
-# ---------------------------
-# 🌐 FETCH COIN PRICE DATA (DAILY & HOURLY)
-# ---------------------------
 def get_price_data(symbol="BTCUSDT", days=30):
-    """Fetch daily historical prices from CoinGecko or fallback to CryptoCompare"""
     prices, dates, errors = [], [], []
     coin = symbol.replace("USDT","").lower()
-
-    # CoinGecko
     try:
         url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
         data_cg = requests.get(url_cg, timeout=5).json()
@@ -42,12 +27,8 @@ def get_price_data(symbol="BTCUSDT", days=30):
             prices = [x[1] for x in data_cg["prices"]]
             dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg["prices"]]
             return np.array(prices), dates, errors
-        else:
-            errors.append(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
-    except Exception as e:
-        errors.append(f"CoinGecko fetch failed: {e}")
-
-    # CryptoCompare fallback
+        else: errors.append(f"CoinGecko returned unexpected data for {symbol}")
+    except Exception as e: errors.append(f"CoinGecko fetch failed for {symbol}: {e}")
     try:
         url_cc = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol[:3]}&tsym=USD&limit={days-1}"
         data_cc = requests.get(url_cc, timeout=5).json()
@@ -55,37 +36,13 @@ def get_price_data(symbol="BTCUSDT", days=30):
             prices = [x["close"] for x in data_cc["Data"]["Data"]]
             dates = [datetime.fromtimestamp(x["time"]) for x in data_cc["Data"]["Data"]]
             return np.array(prices), dates, errors
-        else:
-            errors.append(f"CryptoCompare returned unexpected data for {symbol}: {data_cc}")
-    except Exception as e:
-        errors.append(f"CryptoCompare fetch failed: {e}")
-
+        else: errors.append(f"CryptoCompare returned unexpected data for {symbol}")
+    except Exception as e: errors.append(f"CryptoCompare fetch failed for {symbol}: {e}")
     errors.append(f"Failed to fetch price data for {symbol}.")
     return np.array([]), [], errors
 
-def get_hourly_data(symbol="BTCUSDT", hours=72):
-    """Fetch hourly prices (used for today)"""
-    fsym = symbol.replace("USDT", "")
-    url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={hours-1}"
-    try:
-        data = requests.get(url, timeout=5).json()
-        prices, dates = [], []
-        if "Data" in data and "Data" in data["Data"]:
-            raw = data["Data"]["Data"]
-            prices = [x["close"] for x in raw]
-            dates = [datetime.fromtimestamp(x["time"]) for x in raw]
-        return np.array(prices), dates
-    except:
-        return np.array([]), []
-
-# ---------------------------
-# 📊 HISTORICAL DATA HANDLER (DATABASE)
-# ---------------------------
 def get_historical_data(symbol="BTCUSDT"):
-    """Get historical data from Firebase or fetch and save if not present"""
     prices, dates, errors = [], [], []
-
-    # Firebase
     try:
         ref = db.reference(f"historical/{symbol}")
         data = ref.get() or {}
@@ -94,55 +51,54 @@ def get_historical_data(symbol="BTCUSDT"):
             prices = [v["price"] for _,v in sorted_data]
             dates = [datetime.fromisoformat(v["time"]) for _,v in sorted_data]
             return np.array(prices), dates, errors
-    except Exception as e:
-        errors.append(f"Firebase read failed: {e}")
-
-    # Fetch from API
+    except Exception as e: errors.append(f"Firebase read failed for {symbol}: {e}")
     prices, dates, fetch_errors = get_price_data(symbol, days=30)
     errors += fetch_errors
-
-    # Save to Firebase
     try:
         ref = db.reference(f"historical/{symbol}")
         for i in range(len(prices)):
             ref.push({"time": dates[i].isoformat(), "price": float(prices[i])})
-    except Exception as e:
-        errors.append(f"Firebase save failed: {e}")
-
+    except Exception as e: errors.append(f"Firebase save failed for {symbol}: {e}")
     return np.array(prices), dates, errors
 
-# ---------------------------
-# 📈 INDICATORS
-# ---------------------------
+def get_hourly_data(symbol="BTCUSDT", hours=72):
+    fsym = symbol.replace("USDT", "")
+    try:
+        url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={hours-1}"
+        data = requests.get(url, timeout=5).json()
+        prices, dates = [], []
+        if "Data" in data and "Data" in data["Data"]:
+            raw = data["Data"]["Data"]
+            prices = [x["close"] for x in raw]
+            dates = [datetime.fromtimestamp(x["time"]) for x in raw]
+            return np.array(prices), dates
+    except: pass
+    return np.array([]), []
+
 def calculate_rsi(prices, period=14):
-    if len(prices)<period: return np.zeros(len(prices))
     delta = np.diff(prices)
     gain = np.maximum(delta,0)
     loss = np.abs(np.minimum(delta,0))
-    avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
-    rs = avg_gain / (avg_loss + 1e-9)
-    rsi = 100 - (100 / (1+rs))
-    return np.concatenate([[50], rsi])
+    avg_gain = pd.Series(gain).rolling(period).mean()
+    avg_loss = pd.Series(loss).rolling(period).mean()
+    rs = avg_gain/(avg_loss+1e-9)
+    rsi = 100-(100/(1+rs))
+    return np.concatenate([[50], rsi.fillna(50)])
 
 def calculate_macd(prices):
-    exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
-    exp2 = pd.Series(prices).ewm(span=26, adjust=False).mean()
+    exp1 = pd.Series(prices).ewm(span=12).mean()
+    exp2 = pd.Series(prices).ewm(span=26).mean()
     macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
+    signal = macd.ewm(span=9).mean()
     return macd.values, signal.values
 
-# ---------------------------
-# 📰 SENTIMENT
-# ---------------------------
 def get_sentiment():
-    """Fetch crypto news sentiment from CryptoCompare"""
     try:
-        url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
-        data = requests.get(url, timeout=5).json()
+        url="https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
+        data=requests.get(url, timeout=5).json()
         if "Data" not in data: return 0
         analyzer = SentimentIntensityAnalyzer()
-        scores = []
+        scores=[]
         for article in data["Data"][:8]:
             title = article.get("title","")
             body = article.get("body","")[:150]
@@ -150,28 +106,23 @@ def get_sentiment():
             vader = analyzer.polarity_scores(text)["compound"]
             blob = TextBlob(text).sentiment.polarity
             scores.append((vader+blob)/2)
-        return max(-1, min(np.mean(scores),1))
-    except:
-        return 0
+        return max(-1,min(np.mean(scores),1)) if scores else 0
+    except: return 0
 
-# ---------------------------
-# 🔮 FORECASTS (ARIMA + PROPHET + HYBRID)
-# ---------------------------
 def arima_forecast(prices, steps):
     try:
-        model = ARIMA(prices, order=(2,1,2))
-        fit = model.fit()
-        return list(fit.forecast(steps=steps))
-    except:
-        return [prices[-1]]*steps
+        model=ARIMA(prices, order=(2,1,2))
+        model_fit=model.fit()
+        return list(model_fit.forecast(steps=steps))
+    except: return [prices[-1]]*steps
 
 def prophet_forecast(dates, prices, steps):
-    if len(prices)<2: return [prices[-1]]*steps, [prices[-1]]*steps, [prices[-1]]*steps
-    df = pd.DataFrame({"ds": pd.to_datetime(dates), "y": prices})
-    model = Prophet(daily_seasonality=True)
+    df=pd.DataFrame({"ds":pd.to_datetime(dates),"y":prices})
+    model=Prophet(daily_seasonality=True)
+    if len(df)<2: return np.array([prices[-1]]*steps), np.array([prices[-1]]*steps), np.array([prices[-1]]*steps)
     model.fit(df)
-    future = model.make_future_dataframe(periods=steps, freq='H')
-    forecast = model.predict(future)
+    future=model.make_future_dataframe(periods=steps,freq='H')
+    forecast=model.predict(future)
     return forecast["yhat"].tail(steps).values, forecast["yhat_upper"].tail(steps).values, forecast["yhat_lower"].tail(steps).values
 
 def hybrid_forecast(prices, dates, steps):
@@ -180,201 +131,128 @@ def hybrid_forecast(prices, dates, steps):
     final = [(a+p)/2 for a,p in zip(arima_preds, prophet_preds)]
     return final, upper, lower
 
-# ---------------------------
-# 🧠 SMART SIGNAL + WEIGHTS
-# ---------------------------
 def load_weights():
-    try:
-        ref = db.reference("weights")
-        data = ref.get() or {}
-        return data if data else {"rsi":1,"macd":1,"trend":1,"sentiment":1}
-    except:
-        return {"rsi":1,"macd":1,"trend":1,"sentiment":1}
+    try: data=db.reference("weights").get()
+    except: data=None
+    if not data: return {"rsi":1,"macd":1,"trend":1,"sentiment":1}
+    return data
 
 def save_weights(weights):
-    try:
-        db.reference("weights").set(weights)
-    except:
-        pass
+    try: db.reference("weights").set(weights)
+    except: pass
 
-def smart_signal(prices, rsi, macd, signal, sentiment, weights):
-    score = 0
-    contribs = {}
-    # RSI
-    val = 0
+def smart_signal(prices,rsi,macd,signal,sentiment,weights):
+    score=0
+    contrib={}
+    val=0
     if rsi[-1]<30: val=2*weights["rsi"]
     elif rsi[-1]>70: val=-2*weights["rsi"]
-    score+=val; contribs["rsi"]=val
-    # MACD
+    score+=val; contrib["rsi"]=val
     val=(1 if macd[-1]>signal[-1] else -1)*weights["macd"]
-    score+=val; contribs["macd"]=val
-    # Trend
+    score+=val; contrib["macd"]=val
     val=(1 if prices[-1]>np.mean(prices) else -1)*weights["trend"]
-    score+=val; contribs["trend"]=val
-    # Sentiment
-    val=0
+    score+=val; contrib["trend"]=val
     if sentiment>0.2: val=2*weights["sentiment"]
     elif sentiment<-0.2: val=-2*weights["sentiment"]
-    score+=val; contribs["sentiment"]=val
-    # Final
-    if score>=3: return "BUY",score,contribs
-    elif score<=-3: return "SELL",score,contribs
-    return "HOLD",score,contribs
+    else: val=0
+    score+=val; contrib["sentiment"]=val
+    if score>=3: return "BUY",score,contrib
+    elif score<=-3: return "SELL",score,contrib
+    return "HOLD",score,contrib
 
 def update_weights(symbol, weights):
-    ref = db.reference(f"history/{symbol}")
+    ref=db.reference(f"history/{symbol}")
     data=list((ref.get() or {}).values())
     if len(data)<2: return weights
-    prev = data[-2]; curr = data[-1]
-    if prev.get("signal","HOLD")=="HOLD": return weights
+    prev=data[-2]; curr=data[-1]
+    if prev["signal"]=="HOLD": return weights
     actual_up = curr["price"]>prev["price"]
-    lr = 0.03
-    contribs=prev.get("contributions",{})
-    for k in weights:
-        c=contribs.get(k,0)
+    lr=0.03
+    contributions=prev.get("contributions",{})
+    for key in weights:
+        c=contributions.get(key,0)
         if c==0: continue
-        if (c>0 and actual_up) or (c<0 and not actual_up):
-            weights[k]*=(1+lr)
-        else:
-            weights[k]*=(1-lr)
-        weights[k]=max(0.2,min(weights[k],3))
+        if (c>0 and actual_up) or (c<0 and not actual_up): weights[key]*=(1+lr)
+        else: weights[key]*=(1-lr)
+        weights[key]=max(0.2,min(weights[key],3))
     return weights
 
-def save_prediction(symbol, price, pred_price, signal, contribs):
-    ref = db.reference(f"history/{symbol}")
-    ref.push({"time":datetime.utcnow().isoformat(),
-              "price":float(price),
-              "predicted":float(pred_price),
-              "signal":signal,
-              "contributions":contribs})
+def save_prediction(symbol, price, pred_price, signal, contrib):
+    ref=db.reference(f"history/{symbol}")
+    ref.push({"time":datetime.utcnow().isoformat(),"price":float(price),"predicted":float(pred_price),"signal":signal,"contributions":contrib})
 
 def calculate_win_rate(symbol):
-    ref = db.reference(f"history/{symbol}")
+    ref=db.reference(f"history/{symbol}")
     data=list((ref.get() or {}).values())
     if len(data)<2: return 0
     wins,total=0,0
     for i in range(len(data)-1):
-        curr=data[i]; nxt=data[i+1]
-        if curr.get("signal","HOLD")=="BUY" and nxt["price"]>curr["price"]: wins+=1
-        elif curr.get("signal","HOLD")=="SELL" and nxt["price"]<curr["price"]: wins+=1
+        curr,nxt=data[i],data[i+1]
+        if curr["signal"]=="BUY" and nxt["price"]>curr["price"]: wins+=1
+        elif curr["signal"]=="SELL" and nxt["price"]<curr["price"]: wins+=1
         total+=1
     return round((wins/total)*100,2)
 
-# ---------------------------
-# 🌏 USDT → IDR RATE
-# ---------------------------
-def get_usdt_idr():
-    try:
-        data=requests.get("https://api.exchangerate.host/convert?from=USD&to=IDR").json()
-        return data.get("result",None)
-    except:
-        return None
-
-# ---------------------------
-# 🎨 STREAMLIT UI
-# ---------------------------
 st.title("🚀 Adaptive AI Crypto Bot")
+coins_list = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD","SOLUSDT"]
+symbols = st.multiselect("Select Coins", coins_list, default=["BTCUSDT","SOLUSDT"])
+timeframe = st.selectbox("Select timeframe", ["1 Day","3 Days","5 Days","1 Month"])
 
-# Show USDT → IDR
-idr_rate = get_usdt_idr()
-st.markdown(f"**USDT → IDR Rate:** {idr_rate if idr_rate else 'N/A'}")
+usd_idr = "N/A"
+try:
+    url = "https://api.exchangerate.host/latest?base=USD&symbols=IDR"
+    r = requests.get(url, timeout=5).json()
+    usd_idr = round(r["rates"]["IDR"],2)
+except: pass
+st.markdown(f"**USDT → IDR Rate: {usd_idr}**")
 
-# Coin selector
-coins_list=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD","SOLUSDT"]
-symbols=st.multiselect("Select Coins",coins_list,default=["BTCUSDT"])
-
-# Timeframe selector
-timeframe=st.selectbox("Select timeframe",["1 Day","3 Days","5 Days","1 Month"])
-
-# Results state
-if "results" not in st.session_state: st.session_state.results={}
-
-# Analyze button
+results = {}
 if st.button("Analyze"):
-    st.session_state.results={}
-    weights=load_weights()
-
+    results={}
     for symbol in symbols:
-        # Historical daily data
         prices, dates, errors = get_historical_data(symbol)
-        if len(prices)==0:
-            with st.expander(f"No Data / Errors for {symbol}"):
-                for e in errors: st.warning(e)
-            continue
-
-        # Hourly data today
-        hourly_prices, hourly_dates = get_hourly_data(symbol, hours=72)
-        today_start = datetime.now().replace(hour=0,minute=0,second=0,microsecond=0)
-        filtered=[(d,p) for d,p in zip(hourly_dates,hourly_prices) if d>=today_start]
-        if filtered:
-            h_dates=[x[0] for x in filtered]
-            h_prices=np.array([x[1] for x in filtered])
-            # Merge with historical daily if needed
-            prices = np.concatenate([prices,h_prices])
-            dates = dates + h_dates
-
-        # Indicators
-        rsi = calculate_rsi(prices)
-        macd, signal_line = calculate_macd(prices)
-        sentiment = get_sentiment()
-
-        # Smart signal
-        trade_signal, score, contribs = smart_signal(prices, rsi, macd, signal_line, sentiment, weights)
-
-        # Forecast remaining hours today
-        now = datetime.now()
-        remaining_hours = 24 - now.hour
-        future_prices, upper, lower = hybrid_forecast(prices, dates, remaining_hours)
-        future_dates = [dates[-1]+timedelta(hours=i+1) for i in range(remaining_hours)]
-
-        # Save prediction
-        save_prediction(symbol, prices[-1], future_prices[0], trade_signal, contribs)
+        new_prices, new_dates = get_hourly_data(symbol, hours=24)
+        if len(new_prices)>0:
+            prices=np.concatenate([prices,new_prices])
+            dates=dates+new_dates
+            try:
+                ref=db.reference(f"historical/{symbol}")
+                for i in range(len(new_prices)):
+                    ref.push({"time":new_dates[i].isoformat(),"price":float(new_prices[i])})
+            except: pass
+        now=datetime.utcnow()
+        if timeframe=="1 Day": cutoff=now-timedelta(days=1)
+        elif timeframe=="3 Days": cutoff=now-timedelta(days=3)
+        elif timeframe=="5 Days": cutoff=now-timedelta(days=5)
+        else: cutoff=now-timedelta(days=30)
+        filtered_prices=[p for d,p in zip(dates,prices) if d>=cutoff]
+        filtered_dates=[d for d in dates if d>=cutoff]
+        if len(filtered_prices)<2: continue
+        weights=load_weights()
+        rsi=calculate_rsi(filtered_prices)
+        macd,signal_line=calculate_macd(filtered_prices)
+        sentiment=get_sentiment()
+        trade_signal, score, contrib = smart_signal(filtered_prices,rsi,macd,signal_line,sentiment,weights)
+        remaining_hours=24-now.hour
+        future_prices, upper, lower = hybrid_forecast(filtered_prices, filtered_dates, remaining_hours)
+        future_dates=[filtered_dates[-1]+timedelta(hours=i+1) for i in range(remaining_hours)]
+        save_prediction(symbol,filtered_prices[-1],future_prices[0],trade_signal,contrib)
         weights=update_weights(symbol,weights)
         save_weights(weights)
-
-        # Store result
-        st.session_state.results[symbol]={"prices":prices,"dates":dates,
-                                          "future_prices":future_prices,"future_dates":future_dates,
-                                          "signal":trade_signal,"score":score,"contribs":contribs}
-
-# ---------------------------
-# 📊 DISPLAY RESULTS
-# ---------------------------
-if st.session_state.results:
-    # Summary table
-    summary=[]
-    for s,r in st.session_state.results.items():
-        today_prices = [p for d,p in zip(r["dates"],r["prices"]) if d.date()==datetime.now().date()]
-        if today_prices:
-            start=today_prices[0]; end=today_prices[-1]
-            change_pct = ((end-start)/start)*100
-            summary.append({"Coin":s,"Signal":r["signal"],"Score":round(r["score"],2),
-                            "Change (%)":round(change_pct,2)})
-    if summary:
-        st.subheader("📋 Summary")
-        st.dataframe(pd.DataFrame(summary))
-
-    # Individual charts
-    for s,r in st.session_state.results.items():
-        st.subheader(f"Analysis for {s}")
-
-        fig = go.Figure()
-        # Historical + hourly prices
-        fig.add_trace(go.Scatter(x=r["dates"],y=r["prices"],mode='lines+markers',name='Price',line=dict(color='blue')))
-        # Forecast
-        fig.add_trace(go.Scatter(x=[r["dates"][-1]]+r["future_dates"],
-                                 y=[r["prices"][-1]]+r["future_prices"],
-                                 mode='lines+markers',name='Forecast',
-                                 line=dict(dash='dash',color='red')))
-        # Confidence band
-        fig.add_trace(go.Scatter(x=r["future_dates"]+r["future_dates"][::-1],
-                                 y=list(r["future_prices"]+r["future_prices"][::-1]),
-                                 fill='toself',name='Confidence',opacity=0.2))
-
-        st.plotly_chart(fig)
-
-        # Metrics
-        st.metric("Signal", r["signal"])
-        st.metric("Score", round(r["score"],2))
-        st.metric("Next Hour Price", round(r["future_prices"][0],2))
-        st.metric("Win Rate (%)", calculate_win_rate(s))
+        results[symbol]={"prices":filtered_prices,"dates":filtered_dates,"future_prices":future_prices,"future_dates":future_dates,"signal":trade_signal,"score":score,"contrib":contrib,"winrate":calculate_win_rate(symbol)}
+    if results:
+        df_summary=pd.DataFrame([
+            {"Coin":s,"Signal":results[s]["signal"],"Score":round(results[s]["score"],2),"WinRate(%)":results[s]["winrate"],"Change(%)":round((results[s]["future_prices"][0]-results[s]["prices"][-1])/results[s]["prices"][-1]*100,2)} 
+            for s in results
+        ])
+        st.table(df_summary)
+        for symbol,res in results.items():
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=res["dates"],y=res["prices"],mode='lines+markers',name='Actual',line=dict(color='blue')))
+            fig.add_trace(go.Scatter(x=[res["prices"][0]]+[res["future_dates"][0]],y=[res["prices"][0]]+[res["future_prices"][0]],mode='lines',name='Change',line=dict(color='green',dash='dot')))
+            fig.add_trace(go.Scatter(x=res["future_dates"],y=res["future_prices"],mode='lines+markers',name='Forecast',line=dict(color='red',dash='dash')))
+            st.plotly_chart(fig)
+            st.metric(f"{symbol} Signal", res["signal"])
+            st.metric(f"{symbol} Score", round(res["score"],2))
+            st.metric(f"{symbol} Next Hour Price", round(res["future_prices"][0],2))
+            st.metric(f"{symbol} WinRate(%)", res["winrate"])
