@@ -32,14 +32,17 @@ if not firebase_admin._apps:
 def get_price_data(symbol="BTCUSDT", limit=30):
     prices, dates = [], []
 
-    # Binance
+    # Binance API
     try:
         url_binance = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit={limit}"
-        data_binance = requests.get(url_binance, timeout=5).json()
-        prices = [float(x[4]) for x in data_binance]
-        dates = [datetime.fromtimestamp(x[0]/1000) for x in data_binance]
-        if prices:
+        res = requests.get(url_binance, timeout=5)
+        data_binance = res.json()
+        if isinstance(data_binance, list) and len(data_binance) > 0:
+            prices = [float(x[4]) for x in data_binance]
+            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_binance]
             return np.array(prices), dates
+        else:
+            st.warning(f"Binance returned unexpected data for {symbol}: {data_binance}")
     except Exception as e:
         st.warning(f"Binance fetch failed for {symbol}: {e}")
 
@@ -47,11 +50,14 @@ def get_price_data(symbol="BTCUSDT", limit=30):
     try:
         coin = symbol.replace("USDT","").lower()
         url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={limit}"
-        data_cg = requests.get(url_cg, timeout=5).json()
-        prices = [x[1] for x in data_cg.get("prices",[])]
-        dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg.get("prices",[])]
-        if prices:
+        res = requests.get(url_cg, timeout=5)
+        data_cg = res.json()
+        if "prices" in data_cg and len(data_cg["prices"]) > 0:
+            prices = [x[1] for x in data_cg["prices"]]
+            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg["prices"]]
             return np.array(prices), dates
+        else:
+            st.warning(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
     except Exception as e:
         st.warning(f"CoinGecko fetch failed for {symbol}: {e}")
 
