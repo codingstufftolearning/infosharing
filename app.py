@@ -1,4 +1,4 @@
-# app.py - Polished Adaptive AI Crypto Bot with Real-Time + Forecast
+# app.py - Multi-Coin Adaptive AI Crypto Bot with Statistics
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -33,7 +33,6 @@ def get_price_data(symbol="BTCUSDT", days=30):
     prices, dates, errors = [], [], []
     coin = symbol.replace("USDT","").lower()
 
-    # CoinGecko
     try:
         url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
         data_cg = requests.get(url_cg, timeout=5).json()
@@ -41,12 +40,7 @@ def get_price_data(symbol="BTCUSDT", days=30):
             prices = [x[1] for x in data_cg["prices"]]
             dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg["prices"]]
             return np.array(prices), dates, errors
-        else:
-            errors.append(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
-    except Exception as e:
-        errors.append(f"CoinGecko fetch failed for {symbol}: {e}")
-
-    # CryptoCompare fallback
+    except: pass
     try:
         url_cc = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol[:3]}&tsym=USD&limit={days-1}"
         data_cc = requests.get(url_cc, timeout=5).json()
@@ -54,12 +48,8 @@ def get_price_data(symbol="BTCUSDT", days=30):
             prices = [x["close"] for x in data_cc["Data"]["Data"]]
             dates = [datetime.fromtimestamp(x["time"]) for x in data_cc["Data"]["Data"]]
             return np.array(prices), dates, errors
-        else:
-            errors.append(f"CryptoCompare returned unexpected data for {symbol}: {data_cc}")
-    except Exception as e:
-        errors.append(f"CryptoCompare fetch failed for {symbol}: {e}")
-
-    errors.append(f"Failed to fetch price data for {symbol}.")
+    except: pass
+    errors.append(f"Failed to fetch {symbol}")
     return np.array([]), [], errors
 
 # ---------------------------
@@ -130,86 +120,68 @@ def arima_forecast(prices, steps):
         return [prices[-1]]*steps
 
 def hybrid_forecast(prices, dates, steps):
-    # Use ARIMA only for simplicity and stability
     return arima_forecast(prices, steps)
 
 # ---------------------------
-# 🧠 WEIGHTS & SMART SIGNAL
+# 🧠 SMART SIGNAL & WEIGHTS
 # ---------------------------
 def load_weights():
     try:
         ref = db.reference("weights")
         data = ref.get()
         return data if data else {"rsi":1.0,"macd":1.0,"trend":1.0,"sentiment":1.0}
-    except:
-        return {"rsi":1.0,"macd":1.0,"trend":1.0,"sentiment":1.0}
+    except: return {"rsi":1.0,"macd":1.0,"trend":1.0,"sentiment":1.0}
 
 def save_weights(weights):
-    try:
-        db.reference("weights").set(weights)
+    try: db.reference("weights").set(weights)
     except: pass
 
 def smart_signal(prices, rsi, macd, signal, sentiment, weights):
-    score = 0
-    contributions = {}
-    # RSI
-    val = 0
-    if rsi[-1]<30: val = 2*weights["rsi"]
-    elif rsi[-1]>70: val = -2*weights["rsi"]
-    score += val
+    score=0
+    contributions={}
+    val=0
+    if rsi[-1]<30: val=2*weights["rsi"]
+    elif rsi[-1]>70: val=-2*weights["rsi"]
+    score+=val
     contributions["rsi"]=val
-    # MACD
-    val = (1 if macd[-1]>signal[-1] else -1)*weights["macd"]
-    score += val
+    val=(1 if macd[-1]>signal[-1] else -1)*weights["macd"]
+    score+=val
     contributions["macd"]=val
-    # Trend
-    val = (1 if prices[-1]>np.mean(prices) else -1)*weights["trend"]
-    score += val
+    val=(1 if prices[-1]>np.mean(prices) else -1)*weights["trend"]
+    score+=val
     contributions["trend"]=val
-    # Sentiment
     val=0
     if sentiment>0.2: val=2*weights["sentiment"]
     elif sentiment<-0.2: val=-2*weights["sentiment"]
     score+=val
     contributions["sentiment"]=val
-    # Decision
     if score>=3: return "BUY",score,contributions
     elif score<=-3: return "SELL",score,contributions
     return "HOLD",score,contributions
 
-# ---------------------------
-# 🔁 ADAPTIVE LEARNING
-# ---------------------------
 def update_weights(symbol, weights):
     try:
-        ref = db.reference(f"history/{symbol}")
-        data = list((ref.get() or {}).values())
+        ref=db.reference(f"history/{symbol}")
+        data=list((ref.get() or {}).values())
         if len(data)<2: return weights
-        prev = data[-2]
-        curr = data[-1]
-        signal = prev.get("signal","HOLD")
+        prev=data[-2]; curr=data[-1]
+        signal=prev.get("signal","HOLD")
         if signal=="HOLD": return weights
-        actual_up = curr["price"]>prev["price"]
+        actual_up=curr["price"]>prev["price"]
         lr=0.03
-        contributions = prev.get("contributions",{})
+        contributions=prev.get("contributions",{})
         for key in weights:
-            contrib = contributions.get(key,0)
+            contrib=contributions.get(key,0)
             if contrib==0: continue
-            if (contrib>0 and actual_up) or (contrib<0 and not actual_up):
-                weights[key]*=(1+lr)
-            else:
-                weights[key]*=(1-lr)
+            if (contrib>0 and actual_up) or (contrib<0 and not actual_up): weights[key]*=(1+lr)
+            else: weights[key]*=(1-lr)
             weights[key]=max(0.2,min(weights[key],3))
         return weights
-    except:
-        return weights
+    except: return weights
 
-# ---------------------------
-# ☁️ SAVE HISTORY
-# ---------------------------
 def save_prediction(symbol, price, pred_price, signal, contributions):
     try:
-        ref = db.reference(f"history/{symbol}")
+        ref=db.reference(f"history/{symbol}")
         ref.push({
             "time": datetime.utcnow().isoformat(),
             "price": float(price),
@@ -221,8 +193,8 @@ def save_prediction(symbol, price, pred_price, signal, contributions):
 
 def calculate_win_rate(symbol):
     try:
-        ref = db.reference(f"history/{symbol}")
-        data = list((ref.get() or {}).values())
+        ref=db.reference(f"history/{symbol}")
+        data=list((ref.get() or {}).values())
         if len(data)<2: return 0
         wins,total=0,0
         for i in range(len(data)-1):
@@ -231,85 +203,88 @@ def calculate_win_rate(symbol):
             elif curr.get("signal","HOLD")=="SELL" and nxt["price"]<curr["price"]: wins+=1
             total+=1
         return round((wins/total)*100,2) if total>0 else 0
-    except:
-        return 0
+    except: return 0
 
 # ---------------------------
 # 🎨 STREAMLIT UI
 # ---------------------------
-st.title("🚀 Adaptive AI Crypto Trading Bot")
+st.title("🚀 Adaptive Multi-Coin AI Crypto Bot")
 
-coins_list = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD"]
-symbol = st.selectbox("Select Coin", coins_list)
+coins_list = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD","SOLUSDT"]
+symbols = st.multiselect("Select Coins", coins_list, default=["BTCUSDT"])
 
 timeframe = st.selectbox("Select Timeframe", ["1 Day","3 Days","5 Days","1 Month","Today Real-Time"])
 
 if st.button("Analyze"):
+    for symbol in symbols:
+        # ----- Historical Prices -----
+        prices, dates, errors = get_price_data(symbol, days=30)
+        if len(prices)==0:
+            st.warning(f"No data for {symbol}")
+            continue
 
-    # ----- Historical prices -----
-    prices, dates, errors = get_price_data(symbol, days=30)
-    if len(prices)==0:
-        st.warning("Cannot fetch historical data")
-        st.stop()
+        # ----- Live Today Prices -----
+        if timeframe=="Today Real-Time":
+            hourly_prices, hourly_dates = get_hourly_data(symbol)
+            start_today=datetime.utcnow().replace(hour=0,minute=0,second=0,microsecond=0)
+            filtered=[(d,p) for d,p in zip(hourly_dates,hourly_prices) if d>=start_today]
+            if filtered:
+                hourly_dates=[x[0] for x in filtered]
+                hourly_prices=np.array([x[1] for x in filtered])
+                dates=hourly_dates; prices=hourly_prices
 
-    # ----- Live today prices -----
-    if timeframe=="Today Real-Time":
-        hourly_prices, hourly_dates = get_hourly_data(symbol)
-        start_today = datetime.utcnow().replace(hour=0,minute=0,second=0,microsecond=0)
-        filtered = [(d,p) for d,p in zip(hourly_dates,hourly_prices) if d>=start_today]
-        if filtered:
-            hourly_dates = [x[0] for x in filtered]
-            hourly_prices = np.array([x[1] for x in filtered])
-            dates = hourly_dates
-            prices = hourly_prices
+        # ----- Indicators & Sentiment -----
+        rsi=calculate_rsi(prices)
+        macd,signal_line=calculate_macd(prices)
+        sentiment=get_sentiment()
+        weights=load_weights()
+        signal, score, contributions=smart_signal(prices,rsi,macd,signal_line,sentiment,weights)
 
-    # ----- Indicators & Sentiment -----
-    rsi = calculate_rsi(prices)
-    macd, signal_line = calculate_macd(prices)
-    sentiment = get_sentiment()
+        # ----- Forecast -----
+        now=datetime.utcnow()
+        remaining_hours=24-now.hour
+        future_prices=[]
+        future_dates=[]
+        if remaining_hours>0:
+            future_prices=hybrid_forecast(prices, dates, remaining_hours)
+            future_dates=[dates[-1]+timedelta(hours=i+1) for i in range(remaining_hours)]
 
-    weights = load_weights()
-    trade_signal, score, contributions = smart_signal(prices,rsi,macd,signal_line,sentiment,weights)
+        # ----- Save Prediction & Update Weights -----
+        if future_prices:
+            save_prediction(symbol, prices[-1], future_prices[0], signal, contributions)
+        weights=update_weights(symbol, weights)
+        save_weights(weights)
 
-    # ----- Forecast for remaining hours today -----
-    now = datetime.utcnow()
-    remaining_hours = 24 - now.hour
-    if remaining_hours>0:
-        future_prices = hybrid_forecast(prices, dates, remaining_hours)
-        future_dates = [dates[-1]+timedelta(hours=i+1) for i in range(remaining_hours)]
-    else:
-        future_prices = []
-        future_dates = []
+        # ----- Statistics -----
+        pct_change_today = round((prices[-1]-prices[0])/prices[0]*100,2) if len(prices)>1 else 0
+        trend_today = "Rising" if pct_change_today>=0 else "Dropping"
+        forecast_pct = round((future_prices[-1]-prices[-1])/prices[-1]*100,2) if future_prices else 0
 
-    # ----- Save to Firebase -----
-    if future_prices:
-        save_prediction(symbol, prices[-1], future_prices[0], trade_signal, contributions)
-    weights = update_weights(symbol, weights)
-    save_weights(weights)
+        # ----- Plot -----
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(x=dates,y=prices,mode='lines+markers',name='Actual'))
+        if future_prices:
+            fig.add_trace(go.Scatter(
+                x=[dates[-1]]+future_dates,
+                y=[prices[-1]]+future_prices,
+                mode='lines+markers',
+                name='Forecast',
+                line=dict(dash='dash', color='red')
+            ))
+        st.subheader(f"{symbol} Analysis")
+        st.plotly_chart(fig)
 
-    # ----- Plot -----
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates,y=prices,mode='lines+markers',name='Actual'))
-    if future_prices:
-        fig.add_trace(go.Scatter(
-            x=[dates[-1]]+future_dates,
-            y=[prices[-1]]+future_prices,
-            mode='lines+markers',
-            name='Forecast',
-            line=dict(dash='dash',color='red')
-        ))
+        # ----- Metrics -----
+        st.metric("Signal", signal)
+        st.metric("Score", round(score,2))
+        st.metric("Win Rate (%)", calculate_win_rate(symbol))
+        st.metric("Today's Change (%)", pct_change_today)
+        st.metric("Trend Today", trend_today)
+        if future_prices:
+            st.metric("Forecast Change (%)", forecast_pct)
 
-    st.plotly_chart(fig)
-
-    # ----- Metrics -----
-    st.metric("Signal", trade_signal)
-    st.metric("Score", round(score,2))
-    st.metric("Win Rate (%)", calculate_win_rate(symbol))
-    if future_prices:
-        st.metric("Next Hour Price", round(future_prices[0],2))
-
-    # ----- Debug -----
-    with st.expander("Debug Info"):
-        st.write("Weights:", weights)
-        st.write("Sentiment:", sentiment)
-        st.write("Contributions:", contributions)
+        # ----- Debug -----
+        with st.expander(f"Debug Info - {symbol}"):
+            st.write("Weights:", weights)
+            st.write("Sentiment:", sentiment)
+            st.write("Contributions:", contributions)
