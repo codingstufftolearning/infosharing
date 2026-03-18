@@ -23,90 +23,117 @@ if not firebase_admin._apps:
             "databaseURL": firebase_dict["databaseURL"]
         })
     except Exception as e:
-        st.error(f"Firebase init failed: {type(e).__name__}: {e}")
-        import traceback
-        st.text(traceback.format_exc())
+        with st.expander("Firebase Initialization Error"):
+            st.error(f"{type(e).__name__}: {e}")
+            import traceback
+            st.text(traceback.format_exc())
 
 # ---------------------------
-# 📊 FETCH PRICE DATA (MULTI-SOURCE + FALLBACK)
+# 📊 FETCH PRICE DATA (MULTI-SOURCE)
 # ---------------------------
 @st.cache_data(ttl=300)
-def get_price_data(symbol="BTCUSDT", limit=30):
+def get_price_data(symbol="BTCUSDT", days=30):
     """
-    Fetch historical price data from multiple sources: Binance, CoinGecko, Kraken
+    Fetch historical price data from multiple sources:
+    CoinGecko, CryptoCompare, CoinPaprika, Nomics
     Returns:
         prices: np.array
         dates: list of datetime
+        errors: list of error messages
     """
     prices, dates = [], []
+    errors = []
 
-    # Normalize coin name
-    coin = symbol.replace("USDT", "").lower()
+    coin_id_map = {
+        "BTCUSDT":"bitcoin",
+        "ETHUSDT":"ethereum",
+        "BNBUSDT":"binancecoin",
+        "ADAUSDT":"cardano",
+        "XAIUSDT":"xai"  # Tesla XAI coin
+    }
 
-    # 1️⃣ Binance
+    coin = coin_id_map.get(symbol, symbol.replace("USDT","").lower())
+    start_ts = int((datetime.now() - timedelta(days=days)).timestamp())
+
+    # 1️⃣ CoinGecko
     try:
-        url_binance = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit={limit}"
-        data_binance = requests.get(url_binance, timeout=5).json()
-        if isinstance(data_binance, list) and len(data_binance)>0:
-            prices = [float(x[4]) for x in data_binance]
-            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_binance]
-            return np.array(prices), dates
-        else:
-            st.warning(f"Binance returned unexpected data for {symbol}: {data_binance}")
-    except Exception as e:
-        st.warning(f"Binance fetch failed for {symbol}: {e}")
-
-    # 2️⃣ CoinGecko
-    try:
-        url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={limit}"
+        url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}&interval=daily"
         data_cg = requests.get(url_cg, timeout=5).json()
-        if "prices" in data_cg and len(data_cg["prices"])>0:
+        if "prices" in data_cg:
             prices = [x[1] for x in data_cg["prices"]]
             dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg["prices"]]
-            return np.array(prices), dates
+            if prices:
+                return np.array(prices), dates, errors
         else:
-            st.warning(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
+            errors.append(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
     except Exception as e:
-        st.warning(f"CoinGecko fetch failed for {symbol}: {e}")
+        errors.append(f"CoinGecko fetch failed for {symbol}: {e}")
 
-    # 3️⃣ Kraken fallback
+    # 2️⃣ CryptoCompare
     try:
-        pair = symbol.replace("USDT","USD")
-        url_kraken = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1440&since={int((datetime.now()-timedelta(days=limit)).timestamp())}"
-        data_kraken = requests.get(url_kraken, timeout=5).json()
-        if "result" in data_kraken:
-            key = list(data_kraken["result"].keys())[0]
-            ohlc = data_kraken["result"][key]
-            prices = [float(x[4]) for x in ohlc]
-            dates = [datetime.fromtimestamp(x[0]) for x in ohlc]
-            return np.array(prices), dates
+        url_cc = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol.replace('USDT','')}&tsym=USD&limit={days}"
+        data_cc = requests.get(url_cc, timeout=5).json()
+        if "Data" in data_cc and "Data" in data_cc["Data"]:
+            prices = [x["close"] for x in data_cc["Data"]["Data"]]
+            dates = [datetime.fromtimestamp(x["time"]) for x in data_cc["Data"]["Data"]]
+            if prices:
+                return np.array(prices), dates, errors
         else:
-            st.warning(f"Kraken returned unexpected data for {symbol}: {data_kraken}")
+            errors.append(f"CryptoCompare returned unexpected data for {symbol}: {data_cc}")
     except Exception as e:
-        st.warning(f"Kraken fetch failed for {symbol}: {e}")
+        errors.append(f"CryptoCompare fetch failed for {symbol}: {e}")
 
-    st.error(f"Failed to fetch price data for {symbol}.")
-    return np.array([]), []
+    # 3️⃣ CoinPaprika
+    try:
+        url_cp = f"https://api.coinpaprika.com/v1/coins/{coin}-usd/historical?start={datetime.now()-timedelta(days=days):%Y-%m-%d}&end={datetime.now():%Y-%m-%d}"
+        data_cp = requests.get(url_cp, timeout=5).json()
+        if isinstance(data_cp, list):
+            prices = [x["close"] for x in data_cp]
+            dates = [datetime.strptime(x["time_close"][:10], "%Y-%m-%d") for x in data_cp]
+            if prices:
+                return np.array(prices), dates, errors
+        else:
+            errors.append(f"CoinPaprika returned unexpected data for {symbol}: {data_cp}")
+    except Exception as e:
+        errors.append(f"CoinPaprika fetch failed for {symbol}: {e}")
+
+    # 4️⃣ Nomics
+    try:
+        api_key = st.secrets.get("nomics_api_key", "")
+        url_nom = f"https://api.nomics.com/v1/currencies/sparkline?key={api_key}&ids={symbol.replace('USDT','')}&start={(datetime.now()-timedelta(days=days)).isoformat()}Z&end={datetime.now().isoformat()}Z"
+        data_nom = requests.get(url_nom, timeout=5).json()
+        if isinstance(data_nom, list) and "prices" in data_nom[0]:
+            prices = [float(p) for p in data_nom[0]["prices"]]
+            dates = [datetime.fromtimestamp(int(ts)) for ts in data_nom[0]["timestamps"]]
+            if prices:
+                return np.array(prices), dates, errors
+        else:
+            errors.append(f"Nomics returned unexpected data for {symbol}: {data_nom}")
+    except Exception as e:
+        errors.append(f"Nomics fetch failed for {symbol}: {e}")
+
+    return np.array(prices), dates, errors
 
 # ---------------------------
 # 📈 INDICATORS
 # ---------------------------
 def calculate_rsi(prices, period=14):
-    if len(prices) < period: return np.zeros(len(prices))
+    if len(prices) < period:
+        return np.zeros(len(prices))
     delta = np.diff(prices)
-    gain = np.maximum(delta, 0)
-    loss = np.abs(np.minimum(delta, 0))
-    avg_gain = pd.Series(gain).rolling(window=period, min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
-    rs = avg_gain/(avg_loss + 1e-9)
+    gain = np.maximum(delta,0)
+    loss = np.abs(np.minimum(delta,0))
+    avg_gain = pd.Series(gain).rolling(window=period,min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(window=period,min_periods=1).mean()
+    rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100/(1+rs))
     return np.concatenate([np.zeros(1), rsi])
 
 def calculate_macd(prices):
-    exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
-    exp2 = pd.Series(prices).ewm(span=26, adjust=False).mean()
+    exp1 = pd.Series(prices).ewm(span=12,adjust=False).mean()
+    exp2 = pd.Series(prices).ewm(span=26,adjust=False).mean()
     macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
+    signal = macd.ewm(span=9,adjust=False).mean()
     return macd.values, signal.values
 
 # ---------------------------
@@ -120,22 +147,24 @@ def get_sentiment(texts=None):
             "Strong bullish momentum ahead"
         ]
     analyzer = SentimentIntensityAnalyzer()
-    scores=[]
-    for t in texts:
-        vader = analyzer.polarity_scores(t)["compound"]
-        blob = TextBlob(t).sentiment.polarity
-        scores.append((vader+blob)/2)
+    scores = []
+    for text in texts:
+        vader = analyzer.polarity_scores(text)["compound"]
+        blob = TextBlob(text).sentiment.polarity
+        scores.append((vader + blob)/2)
     return np.mean(scores)
 
 # ---------------------------
-# 🔮 FORECAST
+# 🔮 SAFE FORECAST
 # ---------------------------
 def forecast_price(prices):
-    if len(prices)<10: return float(prices[-1])
+    if len(prices)<10:
+        return float(prices[-1])
     try:
         model = ARIMA(prices, order=(1,1,1))
         model_fit = model.fit()
-        return float(model_fit.forecast(steps=1)[0])
+        forecast = model_fit.forecast(steps=1)
+        return float(forecast[0])
     except:
         return float(prices[-1])
 
@@ -145,10 +174,7 @@ def forecast_price(prices):
 def load_weights():
     try:
         ref = db.reference("weights")
-        data = ref.get() or {}
-        if not data:
-            return {"rsi":1,"macd":1,"trend":1,"sentiment":1}
-        return data
+        return ref.get() or {"rsi":1,"macd":1,"trend":1,"sentiment":1}
     except:
         return {"rsi":1,"macd":1,"trend":1,"sentiment":1}
 
@@ -162,7 +188,7 @@ def save_weights(weights):
 # 📊 SMART PREDICTION
 # ---------------------------
 def smart_prediction(prices,rsi,macd,signal,sentiment,weights):
-    score=0
+    score = 0
     if rsi[-1]<30: score+=2*weights.get("rsi",1)
     elif rsi[-1]>70: score-=2*weights.get("rsi",1)
     if macd[-1]>signal[-1]: score+=1*weights.get("macd",1)
@@ -199,10 +225,10 @@ def calculate_win_rate(symbol):
         data = ref.get() or {}
         if len(data)<2: return 0
         values=list(data.values())
-        wins,total=0,0
+        wins=total=0
         for i in range(len(values)-1):
-            current = values[i]
-            next_price = values[i+1]["price"]
+            current=values[i]
+            next_price=values[i+1]["price"]
             if current["prediction"]=="BUY" and next_price>current["price"]: wins+=1
             elif current["prediction"]=="SELL" and next_price<current["price"]: wins+=1
             total+=1
@@ -215,66 +241,62 @@ def calculate_win_rate(symbol):
 # ---------------------------
 st.title("🚀 AI Crypto Trading Bot")
 
-symbols = st.multiselect("Select Coins to Analyze", ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT"], default=["BTCUSDT"])
+# Coins
+symbols = st.multiselect("Select Coins", ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSDT"], default=["BTCUSDT"])
 
-# Session persistence
+# Timeframe selection
+timeframes = {"1 Day":1,"3 Days":3,"5 Days":5,"1 Month":30}
+tf_selection = st.selectbox("Select Timeframe", list(timeframes.keys()))
+
+# Persist results
 if "results" not in st.session_state:
-    st.session_state.results = {}
+    st.session_state.results={}
 
 if st.button("Analyze"):
-    st.session_state.results = {}
-    weights = load_weights()
+    st.session_state.results={}
+    weights=load_weights()
     for symbol in symbols:
-        prices, dates = get_price_data(symbol)
+        prices, dates, errors=get_price_data(symbol,days=timeframes[tf_selection])
         if len(prices)==0:
-            st.warning(f"No data for {symbol}, skipping.")
+            with st.expander(f"No data / Errors for {symbol}"):
+                for err in errors:
+                    st.warning(err)
             continue
-
         history = load_history(symbol)
-        if history: prices = np.concatenate([np.array(history), prices])
-
-        rsi = calculate_rsi(prices)
-        macd, signal = calculate_macd(prices)
-        sentiment = get_sentiment()
-        prediction, score = smart_prediction(prices,rsi,macd,signal,sentiment,weights)
-        next_price = forecast_price(prices)
-
-        save_data(symbol, prices[-1], prediction)
+        if history:
+            prices = np.concatenate([np.array(history), prices])
+        rsi=calculate_rsi(prices)
+        macd,signal=calculate_macd(prices)
+        sentiment=get_sentiment()
+        prediction,score=smart_prediction(prices,rsi,macd,signal,sentiment,weights)
+        next_price=forecast_price(prices)
+        save_data(symbol,prices[-1],prediction)
         save_weights(weights)
-
-        st.session_state.results[symbol] = {
-            "prices": prices,
-            "dates": dates,
-            "prediction": prediction,
-            "score": score,
-            "next_price": next_price
-        }
+        st.session_state.results[symbol]={"prices":prices,"dates":dates,"prediction":prediction,"score":score,"next_price":next_price,"errors":errors}
 
 # Display results
-for symbol, result in st.session_state.results.items():
+for symbol,result in st.session_state.results.items():
     st.subheader(f"Analysis for {symbol}")
-    prices = result["prices"]
-    dates = result["dates"]
-    next_price = result["next_price"]
-
-    extended_prices = np.append(prices, next_price)
-    extended_dates = dates + [dates[-1]+timedelta(days=1)]
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dates, y=prices, mode='lines+markers', name='Historical Price'
-    ))
-    fig.add_trace(go.Scatter(
-        x=[dates[-1], dates[-1]+timedelta(days=1)],
-        y=[prices[-1], next_price],
-        mode='lines+markers',
-        name='Estimated Price',
-        line=dict(dash='dash', color='red')
-    ))
-    fig.update_yaxes(range=[min(extended_prices)*0.98, max(extended_prices)*1.02])
+    prices=result["prices"]
+    dates=result["dates"]
+    next_price=result["next_price"]
+    extended_prices=np.append(prices,next_price)
+    extended_dates=dates+[dates[-1]+timedelta(days=1)]
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=dates,y=prices,mode='lines+markers',name='Historical Price'))
+    fig.add_trace(go.Scatter(x=[dates[-1],dates[-1]+timedelta(days=1)],
+                             y=[prices[-1],next_price],
+                             mode='lines+markers',
+                             name='Forecast Price',
+                             line=dict(dash='dash',color='red')))
+    fig.update_yaxes(range=[min(extended_prices)*0.98,max(extended_prices)*1.02])
     st.plotly_chart(fig)
-
-    st.metric("Prediction", result["prediction"])
-    st.metric("Score", result["score"])
-    st.metric("Next Price", round(next_price,2))
-    st.metric("Win Rate (%)", calculate_win_rate(symbol))
+    st.metric("Prediction",result["prediction"])
+    st.metric("Score",result["score"])
+    st.metric("Next Price",round(next_price,2))
+    st.metric("Win Rate (%)",calculate_win_rate(symbol))
+    # Show errors if any
+    if result["errors"]:
+        with st.expander(f"Errors fetching data for {symbol}"):
+            for err in result["errors"]:
+                st.warning(err)
