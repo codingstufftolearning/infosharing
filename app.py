@@ -32,6 +32,7 @@ COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD","SOLUSDT"]
 TIMEFRAMES = {"1 Day":1,"3 Days":3,"5 Days":5,"1 Month":30}
 RSI_PERIOD = 14
 ARIMA_ORDER = (2,1,2)
+ROLLING_DAYS_FOR_INDICATORS = 7
 
 # ---------------------------
 # 📊 Data Fetching with Caching
@@ -48,8 +49,8 @@ def fetch_usdt_idr_rate():
 
 @st.cache_data(ttl=600)
 def fetch_historical(symbol="BTCUSDT", days=30):
-    # Fetch from Firebase first
-    prices, dates, errors = [], [], []
+    # Firebase read first
+    prices, dates = [], []
     try:
         ref = db.reference(f"historical/{symbol}")
         data = ref.get() or {}
@@ -60,7 +61,7 @@ def fetch_historical(symbol="BTCUSDT", days=30):
             return np.array(prices), dates
     except:
         pass
-    # Fetch from API fallback
+    # API fallback
     coin = symbol.replace("USDT","").lower()
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
@@ -156,7 +157,7 @@ def hybrid_forecast(prices, dates, steps=1):
     return combined, upper, lower
 
 # ---------------------------
-# 🧠 Smart Signal
+# 🧠 Smart Signal & Weights
 # ---------------------------
 def load_weights():
     ref=db.reference("weights")
@@ -204,17 +205,21 @@ def save_prediction(symbol, price, pred, sig, contrib):
 def calculate_win_rate(symbol):
     ref=db.reference(f"history/{symbol}")
     data=list((ref.get() or {}).values())
+    valid_data = [d for d in data if "price" in d]
+    if len(valid_data) < 2: return 0
     wins,total=0,0
-    for i in range(len(data)-1):
-        curr,nxt=data[i],data[i+1]
+    for i in range(len(valid_data)-1):
+        curr,nxt=valid_data[i],valid_data[i+1]
         sig=curr.get("signal","HOLD")
-        cp=np_ = 0
-        cp=curr.get("price",0)
-        np_=nxt.get("price",0)
-        if sig=="BUY" and np_>cp: wins+=1
-        elif sig=="SELL" and np_<cp: wins+=1
+        cp,nxt_p = curr.get("price",0), nxt.get("price",0)
+        if sig=="BUY" and nxt_p>cp: wins+=1
+        elif sig=="SELL" and nxt_p<cp: wins+=1
         total+=1
     return round((wins/total)*100,2) if total>0 else 0
+
+def calculate_confidence(upper, lower, last_price):
+    conf = max(0, min(1, 1 - (upper[0] - lower[0])/last_price))
+    return round(conf*100,2)
 
 # ---------------------------
 # 🎨 Streamlit UI
@@ -229,6 +234,21 @@ else:
 
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT"])
 timeframe = st.selectbox("Select Timeframe", list(TIMEFRAMES.keys()))
+
+# Helper: color-coded table
+def apply_colors(val):
+    if val == "BUY":
+        return "background-color: #b6fcb6; color: black"
+    elif val == "SELL":
+        return "background-color: #fcb6b6; color: black"
+    elif val == "HOLD":
+        return "background-color: #fff79a; color: black"
+    try:
+        num = float(val)
+        if num > 0: return "color: green"
+        elif num < 0: return "color: red"
+    except: pass
+    return ""
 
 if st.button("Analyze"):
     with st.spinner("Analyzing coins..."):
@@ -249,13 +269,14 @@ if st.button("Analyze"):
             next_p, upper, lower = hybrid_forecast(fp, fd, 1)
 
             # Indicators & sentiment
-            rsi = calculate_rsi(fp)
-            macd_v, sig_line = calculate_macd(fp)
+            recent_prices = fp[-ROLLING_DAYS_FOR_INDICATORS*24:] if len(fp)>24 else fp
+            rsi = calculate_rsi(recent_prices)
+            macd_v, sig_line = calculate_macd(recent_prices)
             sentiment = get_sentiment()
             weights = load_weights()
 
             # Signal
-            sig, score, contrib = smart_signal(fp, rsi, macd_v, sig_line, sentiment, weights)
+            sig, score, contrib = smart_signal(recent_prices, rsi, macd_v, sig_line, sentiment, weights)
             save_prediction(sym, fp[-1], next_p[0], sig, contrib)
             weights = update_weights(sym, weights)
             save_weights(weights)
@@ -264,6 +285,7 @@ if st.button("Analyze"):
             win_rate = calculate_win_rate(sym)
             change_pct = ((fp[-1]-fp[0])/fp[0])*100
             current_price = fp[-1]
+            confidence = calculate_confidence(upper, lower, current_price)
 
             summary_data.append({
                 "Coin": sym,
@@ -271,7 +293,8 @@ if st.button("Analyze"):
                 "Signal": sig,
                 "Score": round(score,2),
                 "Win Rate (%)": win_rate,
-                "Change (%)": round(change_pct,2)
+                "Change (%)": round(change_pct,2),
+                "Confidence (%)": confidence
             })
 
             # Plot
@@ -283,6 +306,18 @@ if st.button("Analyze"):
                 mode='lines+markers', name='Forecast',
                 line=dict(dash='dash', color='red')
             ))
+            # Upper/lower bounds
+            fig.add_trace(go.Scatter(
+                x=[fd[-1], fd[-1]+timedelta(days=1)],
+                y=[upper[0], upper[0]],
+                mode='lines', line=dict(dash='dot', color='orange'), name='Upper')
+            )
+            fig.add_trace(go.Scatter(
+                x=[fd[-1], fd[-1]+timedelta(days=1)],
+                y=[lower[0], lower[0]],
+                mode='lines', line=dict(dash='dot', color='orange'), name='Lower')
+            )
+
             col1, col2 = st.columns([3,1])
             with col1:
                 st.subheader(f"{sym} Chart")
@@ -293,16 +328,10 @@ if st.button("Analyze"):
                 st.metric("Score", round(score,2))
                 st.metric("Win Rate (%)", win_rate)
                 st.metric("Change (%)", round(change_pct,2))
+                st.metric("Confidence (%)", confidence)
 
         # Summary Table
         if summary_data:
             st.subheader("📊 Summary Table")
             df_summary = pd.DataFrame(summary_data)
-
-            # Color-code signals
-            def color_signal(val):
-                if val=="BUY": return "background-color: #b6fcb6"
-                elif val=="SELL": return "background-color: #fcb6b6"
-                else: return "background-color: #fdfdb6"
-
-            st.dataframe(df_summary.style.applymap(color_signal, subset=["Signal"]))
+            st.dataframe(df_summary.style.applymap(apply_colors))
