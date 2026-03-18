@@ -17,10 +17,10 @@ from firebase_admin import credentials, db
 from statsmodels.tsa.arima.model import ARIMA
 
 # ---------------------------
-# 🔐 FIREBASE INIT (FROM SECRETS)
+# 🔐 FIREBASE INIT
 # ---------------------------
 if not firebase_admin._apps:
-    cred = credentials.Certificate(dict(st.secrets["firebase"]))
+    cred = credentials.Certificate(st.secrets["firebase"])
     firebase_admin.initialize_app(cred, {
         "databaseURL": st.secrets["firebase"]["databaseURL"]
     })
@@ -28,9 +28,18 @@ if not firebase_admin._apps:
 # ---------------------------
 # 📊 FETCH PRICE DATA (BINANCE)
 # ---------------------------
-def get_price_data(symbol="BTCUSDT"):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit=7"
-    data = requests.get(url).json()
+def get_price_data(symbol="BTCUSDT", limit=50):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit={limit}"
+    res = requests.get(url)
+    
+    if res.status_code != 200:
+        st.error(f"Failed to fetch price data: {res.status_code}")
+        return np.array([]), []
+    
+    data = res.json()
+    if not isinstance(data, list):
+        st.error(f"API Error: {data}")
+        return np.array([]), []
 
     prices = [float(x[4]) for x in data]
     dates = [x[0] for x in data]
@@ -41,21 +50,27 @@ def get_price_data(symbol="BTCUSDT"):
 # 📈 INDICATORS
 # ---------------------------
 def calculate_rsi(prices, period=14):
+    if len(prices) < period:
+        return np.zeros(len(prices))
+
     delta = np.diff(prices)
     gain = np.maximum(delta, 0)
     loss = np.abs(np.minimum(delta, 0))
 
-    avg_gain = np.mean(gain)
-    avg_loss = np.mean(loss)
+    avg_gain = pd.Series(gain).rolling(window=period, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
 
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
-    return np.append(np.zeros(len(prices)-1), 100 - (100 / (1 + rs)))
+    rs = avg_gain / (avg_loss + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+
+    rsi_full = np.concatenate([np.zeros(1), rsi])  # diff reduces length by 1
+    return rsi_full
 
 def calculate_macd(prices):
-    exp1 = pd.Series(prices).ewm(span=12).mean()
-    exp2 = pd.Series(prices).ewm(span=26).mean()
+    exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
+    exp2 = pd.Series(prices).ewm(span=26, adjust=False).mean()
     macd = exp1 - exp2
-    signal = macd.ewm(span=9).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
     return macd.values, signal.values
 
 # ---------------------------
@@ -69,7 +84,6 @@ def get_sentiment():
     ]
 
     analyzer = SentimentIntensityAnalyzer()
-
     scores = []
     for text in texts:
         vader = analyzer.polarity_scores(text)["compound"]
@@ -82,6 +96,8 @@ def get_sentiment():
 # 🔮 SAFE FORECAST
 # ---------------------------
 def forecast_price(prices):
+    if len(prices) < 10:
+        return float(prices[-1])
     try:
         model = ARIMA(prices, order=(1,1,1))
         model_fit = model.fit()
@@ -95,10 +111,10 @@ def forecast_price(prices):
 # ---------------------------
 def load_weights():
     ref = db.reference("weights")
-    data = ref.get()
-    if data:
-        return data
-    return {"rsi":1, "macd":1, "trend":1, "sentiment":1}
+    data = ref.get() or {}
+    if not data:
+        return {"rsi":1, "macd":1, "trend":1, "sentiment":1}
+    return data
 
 def save_weights(weights):
     db.reference("weights").set(weights)
@@ -110,24 +126,24 @@ def smart_prediction(prices, rsi, macd, signal, sentiment, weights):
     score = 0
 
     if rsi[-1] < 30:
-        score += 2 * weights["rsi"]
+        score += 2 * weights.get("rsi",1)
     elif rsi[-1] > 70:
-        score -= 2 * weights["rsi"]
+        score -= 2 * weights.get("rsi",1)
 
     if macd[-1] > signal[-1]:
-        score += 1 * weights["macd"]
+        score += 1 * weights.get("macd",1)
     else:
-        score -= 1 * weights["macd"]
+        score -= 1 * weights.get("macd",1)
 
     if prices[-1] > prices.mean():
-        score += 1 * weights["trend"]
+        score += 1 * weights.get("trend",1)
     else:
-        score -= 1 * weights["trend"]
+        score -= 1 * weights.get("trend",1)
 
     if sentiment > 0.2:
-        score += 2 * weights["sentiment"]
+        score += 2 * weights.get("sentiment",1)
     elif sentiment < -0.2:
-        score -= 2 * weights["sentiment"]
+        score -= 2 * weights.get("sentiment",1)
 
     if score >= 3:
         return "BUY", score
@@ -152,11 +168,9 @@ def save_data(symbol, price, prediction):
 # ---------------------------
 def load_history(symbol):
     ref = db.reference(f"history/{symbol}")
-    data = ref.get()
-
+    data = ref.get() or {}
     if not data:
         return []
-
     return [v["price"] for v in data.values()]
 
 # ---------------------------
@@ -164,13 +178,12 @@ def load_history(symbol):
 # ---------------------------
 def calculate_win_rate(symbol):
     ref = db.reference(f"history/{symbol}")
-    data = ref.get()
+    data = ref.get() or {}
 
-    if not data or len(data) < 2:
+    if len(data) < 2:
         return 0
 
     values = list(data.values())
-
     wins = 0
     total = 0
 
@@ -195,42 +208,49 @@ st.title("🚀 AI Trading System")
 symbol = st.selectbox("Select Coin", ["BTCUSDT", "ETHUSDT"])
 
 if st.button("Analyze"):
-    prices, dates = get_price_data(symbol)
+    try:
+        prices, dates = get_price_data(symbol)
 
-    # Load history
-    history = load_history(symbol)
-    if history:
-        prices = np.concatenate([history, prices])
+        if len(prices) == 0:
+            st.stop()
 
-    rsi = calculate_rsi(prices)
-    macd, signal = calculate_macd(prices)
-    sentiment = get_sentiment()
-    weights = load_weights()
+        # Load history
+        history = load_history(symbol)
+        if history:
+            prices = np.concatenate([np.array(history), prices])
 
-    prediction, score = smart_prediction(prices, rsi, macd, signal, sentiment, weights)
-    next_price = forecast_price(prices)
+        rsi = calculate_rsi(prices)
+        macd, signal = calculate_macd(prices)
+        sentiment = get_sentiment()
+        weights = load_weights()
 
-    # Save data
-    save_data(symbol, prices[-1], prediction)
+        prediction, score = smart_prediction(prices, rsi, macd, signal, sentiment, weights)
+        next_price = forecast_price(prices)
 
-    # Chart
-    fig = go.Figure()
+        # Save data
+        save_data(symbol, prices[-1], prediction)
 
-    fig.add_trace(go.Scatter(y=prices, mode='lines', name='Price'))
-    fig.add_trace(go.Scatter(
-        x=[len(prices)-1, len(prices)],
-        y=[prices[-1], next_price],
-        mode='lines',
-        name='Prediction'
-    ))
+        # Chart
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=prices, mode='lines', name='Price'))
+        fig.add_trace(go.Scatter(
+            x=[len(prices)-1, len(prices)],
+            y=[prices[-1], next_price],
+            mode='lines',
+            name='Prediction'
+        ))
+        st.plotly_chart(fig)
 
-    st.plotly_chart(fig)
+        # Metrics
+        st.metric("Prediction", prediction)
+        st.metric("Score", score)
+        st.metric("Next Price", round(next_price, 2))
 
-    # Metrics
-    st.metric("Prediction", prediction)
-    st.metric("Score", score)
-    st.metric("Next Price", round(next_price, 2))
+        # Win rate
+        win_rate = calculate_win_rate(symbol)
+        st.metric("Win Rate (%)", win_rate)
 
-    # Win rate
-    win_rate = calculate_win_rate(symbol)
-    st.metric("Win Rate (%)", win_rate)
+    except Exception as e:
+        st.error(f"Error: {e}")
+        import traceback
+        st.text(traceback.format_exc())
