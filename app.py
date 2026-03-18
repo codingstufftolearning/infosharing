@@ -49,8 +49,6 @@ else:
 def get_price_data(symbol="BTCUSDT", days=30):
     prices, dates, errors = [], [], []
     coin = symbol.replace("USDT","").lower()
-
-    # CoinGecko daily
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
         data = requests.get(url, timeout=5).json()
@@ -61,7 +59,6 @@ def get_price_data(symbol="BTCUSDT", days=30):
     except Exception as e:
         errors.append(f"CoinGecko fetch failed: {e}")
 
-    # CryptoCompare fallback
     try:
         url_cc = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol[:3]}&tsym=USD&limit={days-1}"
         data_cc = requests.get(url_cc, timeout=5).json()
@@ -104,7 +101,7 @@ def get_historical_data(symbol="BTCUSDT"):
     return np.array(prices), dates, errors
 
 # ---------------------------
-# ⏱️ HOURLY DATA (Crypto only)
+# ⏱️ HOURLY DATA
 # ---------------------------
 def get_hourly_data(symbol="BTCUSDT", hours=72):
     fsym = symbol.replace("USDT","")
@@ -249,25 +246,50 @@ symbols=st.multiselect("Select Coins", coins, default=["BTCUSDT"])
 timeframe=st.selectbox("Select Timeframe", ["1 Day","3 Days","5 Days","1 Month"])
 
 if st.button("Analyze"):
+    summary_data=[]
     for sym in symbols:
         prices, dates, errs = get_historical_data(sym)
         if len(prices)==0: continue
+
         hr_prices, hr_dates = get_hourly_data(sym)
         if len(hr_prices)>0:
             prices=np.concatenate([prices,hr_prices]); dates=dates+hr_dates
+
         now=datetime.utcnow()
         if timeframe=="1 Day": cutoff=now-timedelta(days=1)
         elif timeframe=="3 Days": cutoff=now-timedelta(days=3)
         elif timeframe=="5 Days": cutoff=now-timedelta(days=5)
         else: cutoff=now-timedelta(days=30)
+
         fp=[p for d,p in zip(dates,prices) if d>=cutoff]; fd=[d for d in dates if d>=cutoff]
         if len(fp)<2: continue
+
+        # Forecast
         next_p, upper, lower = hybrid_forecast(fp, fd, 1)
+
+        # Indicators
         rsi=calculate_rsi(fp); macd_v, sig_line=calculate_macd(fp)
         sentiment=get_sentiment(); weights=load_weights()
+
+        # Signal
         sig,score,con=smart_signal(fp,rsi,macd_v,sig_line,sentiment,weights)
         save_prediction(sym,fp[-1],next_p[0],sig,con)
         weights=update_weights(sym,weights); save_weights(weights)
+
+        # Metrics
+        win_rate=calculate_win_rate(sym)
+        change_pct=((fp[-1]-fp[0])/fp[0])*100
+        current_price=fp[-1]
+
+        summary_data.append({
+            "Coin": sym,
+            "Current Price": round(current_price,2),
+            "Signal": sig,
+            "Score": round(score,2),
+            "Win Rate (%)": win_rate,
+            "Change (%)": round(change_pct,2)
+        })
+
         # Plot
         fig=go.Figure()
         fig.add_trace(go.Scatter(x=fd,y=fp,mode='lines+markers',name='Actual'))
@@ -278,7 +300,13 @@ if st.button("Analyze"):
         ))
         st.subheader(f"{sym} Chart")
         st.plotly_chart(fig)
+        st.metric("Current Price", round(current_price,2))
         st.metric("Signal",sig); st.metric("Score",round(score,2))
-        st.metric("Win Rate (%)",calculate_win_rate(sym))
-        change_pct=((fp[-1]-fp[0])/fp[0])*100
+        st.metric("Win Rate (%)",win_rate)
         st.metric("Change (%)",round(change_pct,2))
+
+    # Show summary table
+    if summary_data:
+        st.subheader("📊 Summary Table")
+        df_summary=pd.DataFrame(summary_data)
+        st.dataframe(df_summary)
