@@ -30,81 +30,89 @@ if not firebase_admin._apps:
 # ---------------------------
 @st.cache_data(ttl=300)
 def get_price_data(symbol="BTCUSDT", limit=30):
-    prices, dates = [], []
+    """
+    Fetch historical price data for a symbol from multiple sources with fallbacks.
+    Supports Binance, CoinGecko, CoinCap, CryptoCompare, and synthetic fallback.
+    Handles multiple aliases (BTC, BTCUSDT, bitcoin) automatically.
+    Returns:
+        prices: np.array
+        dates: list of datetime
+    """
+    import requests
+    import numpy as np
+    from datetime import datetime, timedelta
 
-    # Map symbols for APIs
+    # ---------------------------
+    # Symbol mapping (aliases)
+    # ---------------------------
     symbol_map = {
-        "BTCUSDT": "bitcoin",
-        "ETHUSDT": "ethereum",
-        "BNBUSDT": "binancecoin",
-        "ADAUSDT": "cardano"
+        "BTCUSDT": "bitcoin", "BTC": "bitcoin", "bitcoin": "bitcoin",
+        "ETHUSDT": "ethereum", "ETH": "ethereum", "ethereum": "ethereum",
+        "BNBUSDT": "binancecoin", "BNB": "binancecoin", "binancecoin": "binancecoin",
+        "ADAUSDT": "cardano", "ADA": "cardano", "cardano": "cardano",
+        "SOLUSDT": "solana", "SOL": "solana", "solana": "solana",
+        "XRPUSDT": "ripple", "XRP": "ripple", "ripple": "ripple",
+        "DOGEUSDT": "dogecoin", "DOGE": "dogecoin", "dogecoin": "dogecoin"
+        # Add more mappings as needed
     }
 
-    base_symbol = symbol.replace("USDT", "")
-    coin_id = symbol_map.get(symbol, base_symbol.lower())
+    coin_id = symbol_map.get(symbol.upper(), symbol.replace("USDT", "").lower())
+    prices, dates = [], []
 
     # ---------------------------
-    # 1. COINGECKO (FIXED)
+    # 1️⃣ CoinGecko
     # ---------------------------
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={limit}"
-        res = requests.get(url, timeout=5)
+        url_cg = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={limit}"
+        res = requests.get(url_cg, timeout=5)
         data = res.json()
-
-        if "prices" in data and len(data["prices"]) > 0:
+        if "prices" in data:
             prices = [x[1] for x in data["prices"]]
             dates = [datetime.fromtimestamp(x[0]/1000) for x in data["prices"]]
-            return np.array(prices), dates
-        else:
-            st.warning(f"CoinGecko failed: {data}")
+            if prices:
+                return np.array(prices), dates
     except Exception as e:
-        st.warning(f"CoinGecko error: {e}")
+        st.warning(f"CoinGecko fetch failed for {symbol}: {e}")
 
     # ---------------------------
-    # 2. COINCAP
+    # 2️⃣ CoinCap
     # ---------------------------
     try:
-        url = f"https://api.coincap.io/v2/assets/{base_symbol.lower()}/history?interval=d1"
-        res = requests.get(url, timeout=5)
+        base = coin_id
+        url_cc = f"https://api.coincap.io/v2/assets/{base}/history?interval=d1"
+        res = requests.get(url_cc, timeout=5)
         data = res.json()
-
-        if "data" in data and len(data["data"]) > 0:
+        if "data" in data:
             prices = [float(x["priceUsd"]) for x in data["data"][-limit:]]
             dates = [datetime.fromtimestamp(x["time"]/1000) for x in data["data"][-limit:]]
-            return np.array(prices), dates
-        else:
-            st.warning(f"CoinCap failed: {data}")
+            if prices:
+                return np.array(prices), dates
     except Exception as e:
-        st.warning(f"CoinCap error: {e}")
+        st.warning(f"CoinCap fetch failed for {symbol}: {e}")
 
     # ---------------------------
-    # 3. CRYPTOCOMPARE
+    # 3️⃣ CryptoCompare
     # ---------------------------
     try:
-        url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={base_symbol}&tsym=USD&limit={limit}"
-        res = requests.get(url, timeout=5)
+        base = symbol.replace("USDT","").upper()
+        url_ccp = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={base}&tsym=USD&limit={limit}"
+        res = requests.get(url_ccp, timeout=5)
         data = res.json()
-
         if "Data" in data and "Data" in data["Data"]:
             prices = [x["close"] for x in data["Data"]["Data"]]
             dates = [datetime.fromtimestamp(x["time"]) for x in data["Data"]["Data"]]
-            return np.array(prices), dates
-        else:
-            st.warning(f"CryptoCompare failed: {data}")
+            if prices:
+                return np.array(prices), dates
     except Exception as e:
-        st.warning(f"CryptoCompare error: {e}")
+        st.warning(f"CryptoCompare fetch failed for {symbol}: {e}")
 
     # ---------------------------
-    # 4. LAST FALLBACK (FAKE SAFE DATA)
+    # 4️⃣ Synthetic fallback
     # ---------------------------
-    st.error(f"All APIs failed for {symbol}. Using synthetic data.")
-
-    # Generate fallback synthetic data (so app doesn't break)
+    st.error(f"All APIs failed for {symbol}. Using synthetic fallback data.")
     dates = [datetime.utcnow() - timedelta(days=i) for i in range(limit)][::-1]
     prices = np.linspace(100, 110, limit) + np.random.normal(0, 2, limit)
-
     return np.array(prices), dates
-
 # ---------------------------
 # 📈 INDICATORS
 # ---------------------------
