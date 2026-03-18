@@ -10,96 +10,93 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from statsmodels.tsa.arima.model import ARIMA
 import firebase_admin
 from firebase_admin import credentials, db
-import streamlit as st
 
-firebase_admin_initialized = False
-
+# ---------------------------
+# 🔐 FIREBASE INIT
+# ---------------------------
 if not firebase_admin._apps:
     try:
         firebase_dict = dict(st.secrets["firebase"])
-        # Ensure correct newline formatting
         firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
         cred = credentials.Certificate(firebase_dict)
-        firebase_admin.initialize_app(cred, {"databaseURL": firebase_dict["databaseURL"]})
-        firebase_admin_initialized = True
-        st.success("Firebase initialized successfully.")
+        firebase_admin.initialize_app(cred, {
+            "databaseURL": firebase_dict["databaseURL"]
+        })
     except Exception as e:
         st.error(f"Firebase init failed: {type(e).__name__}: {e}")
         import traceback
         st.text(traceback.format_exc())
-else:
-    st.info("Firebase already initialized, skipping re-initialization.")
-    firebase_admin_initialized = True
 
 # ---------------------------
-# 📊 PRICE FETCHING (MULTI-SOURCE, MULTI-COIN)
+# 📊 FETCH PRICE DATA (MULTI-SOURCE)
 # ---------------------------
 @st.cache_data(ttl=300)
-def get_price_data(symbol="BTCUSDT", limit=30, allow_fallback=False):
+def get_price_data(symbol="BTCUSDT", limit=30):
     """
-    Fetch historical price data for a symbol from multiple sources.
+    Fetch historical price data from multiple sources: Binance, CoinGecko, Kraken
     Returns:
-        prices: np.array or None
-        dates: list of datetime or None
+        prices: np.array
+        dates: list of datetime
     """
-    # Symbol mapping for multiple sources
-    symbol_map = {
-        "BTCUSDT": "bitcoin", "BTC": "bitcoin", "bitcoin": "bitcoin",
-        "ETHUSDT": "ethereum", "ETH": "ethereum", "ethereum": "ethereum",
-        "BNBUSDT": "binancecoin", "BNB": "binancecoin", "binancecoin": "binancecoin",
-        "ADAUSDT": "cardano", "ADA": "cardano", "cardano": "cardano",
-        "SOLUSDT": "solana", "SOL": "solana", "solana": "solana",
-        "XRPUSDT": "ripple", "XRP": "ripple", "ripple": "ripple",
-        "DOGEUSDT": "dogecoin", "DOGE": "dogecoin", "dogecoin": "dogecoin"
-    }
-    coin_id = symbol_map.get(symbol.upper(), symbol.replace("USDT","").lower())
+    prices, dates = [], []
 
-    sources = ["CoinGecko", "CoinCap", "CryptoCompare"]
+    # Normalize coin name for CoinGecko/Kraken
+    coin = symbol.replace("USDT", "").lower()
 
-    for source in sources:
-        try:
-            if source == "CoinGecko":
-                url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={limit}"
-                data = requests.get(url, timeout=5).json()
-                if "prices" in data:
-                    prices = [x[1] for x in data["prices"]]
-                    dates = [datetime.fromtimestamp(x[0]/1000) for x in data["prices"]]
-                    if prices: return np.array(prices), dates
-            elif source == "CoinCap":
-                url = f"https://api.coincap.io/v2/assets/{coin_id}/history?interval=d1"
-                data = requests.get(url, timeout=5).json()
-                if "data" in data:
-                    d = data["data"][-limit:]
-                    prices = [float(x["priceUsd"]) for x in d]
-                    dates = [datetime.fromtimestamp(x["time"]/1000) for x in d]
-                    if prices: return np.array(prices), dates
-            elif source == "CryptoCompare":
-                base = symbol.replace("USDT","").upper()
-                url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={base}&tsym=USD&limit={limit}"
-                data = requests.get(url, timeout=5).json()
-                if "Data" in data and "Data" in data["Data"]:
-                    d = data["Data"]["Data"]
-                    prices = [x["close"] for x in d]
-                    dates = [datetime.fromtimestamp(x["time"]) for x in d]
-                    if prices: return np.array(prices), dates
-        except Exception as e:
-            st.warning(f"{source} fetch failed for {symbol}: {e}")
+    # 1️⃣ Binance
+    try:
+        url_binance = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1d&limit={limit}"
+        data_binance = requests.get(url_binance, timeout=5).json()
+        if isinstance(data_binance, list):
+            prices = [float(x[4]) for x in data_binance]
+            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_binance]
+            if prices:
+                return np.array(prices), dates
+        else:
+            st.warning(f"Binance returned unexpected data for {symbol}: {data_binance}")
+    except Exception as e:
+        st.warning(f"Binance fetch failed for {symbol}: {e}")
 
-    # No real data
-    st.error(f"Failed to fetch price data for {symbol} from all sources.")
-    if allow_fallback:
-        dates = [datetime.utcnow() - timedelta(days=i) for i in range(limit)][::-1]
-        prices = np.linspace(100, 110, limit) + np.random.normal(0,2,limit)
-        st.warning(f"Using synthetic fallback data for {symbol}.")
-        return np.array(prices), dates
+    # 2️⃣ CoinGecko
+    try:
+        url_cg = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={limit}"
+        data_cg = requests.get(url_cg, timeout=5).json()
+        if "prices" in data_cg:
+            prices = [x[1] for x in data_cg["prices"]]
+            dates = [datetime.fromtimestamp(x[0]/1000) for x in data_cg["prices"]]
+            if prices:
+                return np.array(prices), dates
+        else:
+            st.warning(f"CoinGecko returned unexpected data for {symbol}: {data_cg}")
+    except Exception as e:
+        st.warning(f"CoinGecko fetch failed for {symbol}: {e}")
 
-    return None, None
+    # 3️⃣ Kraken (fallback)
+    try:
+        pair = symbol.replace("USDT", "USD")  # Kraken uses XBTUSD, ETHUSD etc.
+        url_kraken = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1440&since={int((datetime.now()-timedelta(days=limit)).timestamp())}"
+        data_kraken = requests.get(url_kraken, timeout=5).json()
+        if "result" in data_kraken:
+            key = list(data_kraken["result"].keys())[0]
+            ohlc = data_kraken["result"][key]
+            prices = [float(x[4]) for x in ohlc]
+            dates = [datetime.fromtimestamp(x[0]) for x in ohlc]
+            if prices:
+                return np.array(prices), dates
+        else:
+            st.warning(f"Kraken returned unexpected data for {symbol}: {data_kraken}")
+    except Exception as e:
+        st.warning(f"Kraken fetch failed for {symbol}: {e}")
+
+    st.error(f"Failed to fetch price data for {symbol}.")
+    return np.array([]), []
 
 # ---------------------------
 # 📈 INDICATORS
 # ---------------------------
 def calculate_rsi(prices, period=14):
-    if len(prices) < period: return np.zeros(len(prices))
+    if len(prices) < period:
+        return np.zeros(len(prices))
     delta = np.diff(prices)
     gain = np.maximum(delta, 0)
     loss = np.abs(np.minimum(delta, 0))
@@ -107,8 +104,7 @@ def calculate_rsi(prices, period=14):
     avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
     rs = avg_gain / (avg_loss + 1e-9)
     rsi = 100 - (100 / (1 + rs))
-    rsi_full = np.concatenate([np.zeros(1), rsi])
-    return rsi_full
+    return np.concatenate([np.zeros(1), rsi])  # diff reduces length by 1
 
 def calculate_macd(prices):
     exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
@@ -118,14 +114,14 @@ def calculate_macd(prices):
     return macd.values, signal.values
 
 # ---------------------------
-# 📰 SENTIMENT
+# 📰 SENTIMENT ANALYSIS
 # ---------------------------
 def get_sentiment(texts=None):
     if texts is None:
         texts = [
-            "Market shows bullish signs",
-            "Potential crypto volatility ahead",
-            "Investors are cautious"
+            "Bitcoin is rising fast",
+            "Crypto market crash fears",
+            "Strong bullish momentum ahead"
         ]
     analyzer = SentimentIntensityAnalyzer()
     scores = []
@@ -136,10 +132,11 @@ def get_sentiment(texts=None):
     return np.mean(scores)
 
 # ---------------------------
-# 🔮 SAFE FORECAST
+# 🔮 SAFE FORECAST (ARIMA)
 # ---------------------------
 def forecast_price(prices):
-    if len(prices) < 10: return float(prices[-1])
+    if len(prices) < 10:
+        return float(prices[-1])
     try:
         model = ARIMA(prices, order=(1,1,1))
         model_fit = model.fit()
@@ -152,81 +149,107 @@ def forecast_price(prices):
 # 🧠 AUTO-LEARNING WEIGHTS
 # ---------------------------
 def load_weights():
-    if not firebase_admin_initialized: return {"rsi":1,"macd":1,"trend":1,"sentiment":1}
-    ref = db.reference("weights")
-    data = ref.get() or {}
-    if not data: return {"rsi":1,"macd":1,"trend":1,"sentiment":1}
-    return data
+    try:
+        ref = db.reference("weights")
+        data = ref.get() or {}
+        if not data:
+            return {"rsi":1, "macd":1, "trend":1, "sentiment":1}
+        return data
+    except:
+        return {"rsi":1, "macd":1, "trend":1, "sentiment":1}
 
 def save_weights(weights):
-    if firebase_admin_initialized: db.reference("weights").set(weights)
+    try:
+        db.reference("weights").set(weights)
+    except:
+        pass
 
 # ---------------------------
 # 📊 SMART PREDICTION
 # ---------------------------
 def smart_prediction(prices, rsi, macd, signal, sentiment, weights):
     score = 0
-    if rsi[-1]<30: score += 2*weights.get("rsi",1)
-    elif rsi[-1]>70: score -= 2*weights.get("rsi",1)
-    if macd[-1]>signal[-1]: score += 1*weights.get("macd",1)
+    # RSI
+    if rsi[-1] < 30: score += 2*weights.get("rsi",1)
+    elif rsi[-1] > 70: score -= 2*weights.get("rsi",1)
+    # MACD
+    if macd[-1] > signal[-1]: score += 1*weights.get("macd",1)
     else: score -= 1*weights.get("macd",1)
-    if prices[-1]>prices.mean(): score += 1*weights.get("trend",1)
+    # Trend
+    if prices[-1] > prices.mean(): score += 1*weights.get("trend",1)
     else: score -= 1*weights.get("trend",1)
-    if sentiment>0.2: score += 2*weights.get("sentiment",1)
-    elif sentiment<-0.2: score -= 2*weights.get("sentiment",1)
-    if score>=3: return "BUY", score
-    elif score<=-3: return "SELL", score
+    # Sentiment
+    if sentiment > 0.2: score += 2*weights.get("sentiment",1)
+    elif sentiment < -0.2: score -= 2*weights.get("sentiment",1)
+
+    if score >= 3: return "BUY", score
+    elif score <= -3: return "SELL", score
     else: return "HOLD", score
 
 # ---------------------------
 # ☁️ SAVE & LOAD HISTORY
 # ---------------------------
 def save_data(symbol, price, prediction):
-    if firebase_admin_initialized:
+    try:
         ref = db.reference(f"history/{symbol}")
-        ref.push({"time": datetime.utcnow().isoformat(), "price":float(price), "prediction":prediction})
+        ref.push({
+            "time": datetime.utcnow().isoformat(),
+            "price": float(price),
+            "prediction": prediction
+        })
+    except:
+        pass
 
 def load_history(symbol):
-    if not firebase_admin_initialized: return []
-    ref = db.reference(f"history/{symbol}")
-    data = ref.get() or {}
-    if not data: return []
-    return [v["price"] for v in data.values()]
+    try:
+        ref = db.reference(f"history/{symbol}")
+        data = ref.get() or {}
+        if not data: return []
+        return [v["price"] for v in data.values()]
+    except:
+        return []
 
 def calculate_win_rate(symbol):
-    if not firebase_admin_initialized: return 0
-    ref = db.reference(f"history/{symbol}")
-    data = ref.get() or {}
-    if len(data)<2: return 0
-    values = list(data.values())
-    wins, total = 0,0
-    for i in range(len(values)-1):
-        current = values[i]
-        next_price = values[i+1]["price"]
-        if current["prediction"]=="BUY" and next_price>current["price"]: wins+=1
-        elif current["prediction"]=="SELL" and next_price<current["price"]: wins+=1
-        total+=1
-    return round((wins/total)*100,2) if total>0 else 0
+    try:
+        ref = db.reference(f"history/{symbol}")
+        data = ref.get() or {}
+        if len(data) < 2: return 0
+        values = list(data.values())
+        wins, total = 0, 0
+        for i in range(len(values)-1):
+            current = values[i]
+            next_price = values[i+1]["price"]
+            if current["prediction"]=="BUY" and next_price>current["price"]: wins+=1
+            elif current["prediction"]=="SELL" and next_price<current["price"]: wins+=1
+            total+=1
+        return round((wins/total)*100,2) if total>0 else 0
+    except:
+        return 0
 
 # ---------------------------
 # 🎨 STREAMLIT UI
 # ---------------------------
-st.title("🚀 Multi-Coin AI Crypto Trading Bot")
+st.title("🚀 AI Crypto Trading Bot")
 
-symbols = st.multiselect("Select Coins to Analyze", ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT"], default=["BTCUSDT","ETHUSDT"])
+# Multi-coin selection
+symbols = st.multiselect("Select Coins to Analyze", ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT"], default=["BTCUSDT"])
+
+# Persist results in session state
+if "results" not in st.session_state:
+    st.session_state.results = {}
 
 if st.button("Analyze"):
+    st.session_state.results = {}  # reset previous
     weights = load_weights()
     for symbol in symbols:
-        st.subheader(f"Analysis for {symbol}")
-
-        prices, dates = get_price_data(symbol, limit=30, allow_fallback=False)
-        if prices is None or len(prices)==0:
-            st.warning(f"No price data for {symbol}, skipping analysis.")
+        prices, dates = get_price_data(symbol)
+        if len(prices)==0:
+            st.warning(f"No data for {symbol}, skipping.")
             continue
 
         history = load_history(symbol)
-        if history: prices = np.concatenate([np.array(history), prices])
+        if history:
+            prices = np.concatenate([np.array(history), prices])
 
         rsi = calculate_rsi(prices)
         macd, signal = calculate_macd(prices)
@@ -237,12 +260,43 @@ if st.button("Analyze"):
         save_data(symbol, prices[-1], prediction)
         save_weights(weights)
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=dates, y=prices, mode='lines', name='Price'))
-        fig.add_trace(go.Scatter(x=[dates[-1], dates[-1]+timedelta(days=1)], y=[prices[-1], next_price], mode='lines', name='Prediction'))
-        st.plotly_chart(fig)
+        st.session_state.results[symbol] = {
+            "prices": prices,
+            "dates": dates,
+            "prediction": prediction,
+            "score": score,
+            "next_price": next_price
+        }
 
-        st.metric("Prediction", prediction)
-        st.metric("Score", score)
-        st.metric("Next Price", round(next_price,2))
-        st.metric("Win Rate (%)", calculate_win_rate(symbol))
+# Display results
+for symbol, result in st.session_state.results.items():
+    st.subheader(f"Analysis for {symbol}")
+    prices = result["prices"]
+    dates = result["dates"]
+    next_price = result["next_price"]
+
+    extended_dates = dates + [dates[-1] + timedelta(days=1)]
+    extended_prices = np.append(prices, next_price)
+
+    fig = go.Figure()
+    # Historical
+    fig.add_trace(go.Scatter(
+        x=dates, y=prices, mode='lines+markers', name='Historical Price'
+    ))
+    # Estimated
+    fig.add_trace(go.Scatter(
+        x=[dates[-1], dates[-1]+timedelta(days=1)],
+        y=[prices[-1], next_price],
+        mode='lines+markers',
+        name='Estimated Price',
+        line=dict(dash='dash', color='red')
+    ))
+
+    fig.update_yaxes(range=[min(extended_prices)*0.98, max(extended_prices)*1.02])
+    st.plotly_chart(fig)
+
+    # Metrics
+    st.metric("Prediction", result["prediction"])
+    st.metric("Score", result["score"])
+    st.metric("Next Price", round(next_price,2))
+    st.metric("Win Rate (%)", calculate_win_rate(symbol))
