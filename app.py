@@ -32,7 +32,7 @@ COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","XAIUSD","SOLUSDT"]
 TIMEFRAMES = {"1 Day":1,"3 Days":3,"5 Days":5,"1 Month":30}
 RSI_PERIOD = 14
 ARIMA_ORDER = (2,1,2)
-ROLLING_DAYS_FOR_INDICATORS = 7
+ROLLING_HOURS = 7*24  # last 7 days for indicators
 
 # ---------------------------
 # 📊 Data Fetching with Caching
@@ -49,7 +49,6 @@ def fetch_usdt_idr_rate():
 
 @st.cache_data(ttl=600)
 def fetch_historical(symbol="BTCUSDT", days=30):
-    # Firebase read first
     prices, dates = [], []
     try:
         ref = db.reference(f"historical/{symbol}")
@@ -68,7 +67,6 @@ def fetch_historical(symbol="BTCUSDT", days=30):
         data = requests.get(url, timeout=5).json()
         prices = [x[1] for x in data.get("prices",[])]
         dates = [datetime.fromtimestamp(x[0]/1000) for x in data.get("prices",[])]
-        # Save to Firebase
         try:
             ref = db.reference(f"historical/{symbol}")
             for i in range(len(prices)):
@@ -269,7 +267,7 @@ if st.button("Analyze"):
             next_p, upper, lower = hybrid_forecast(fp, fd, 1)
 
             # Indicators & sentiment
-            recent_prices = fp[-ROLLING_DAYS_FOR_INDICATORS*24:] if len(fp)>24 else fp
+            recent_prices = fp[-ROLLING_HOURS:] if len(fp)>ROLLING_HOURS else fp
             rsi = calculate_rsi(recent_prices)
             macd_v, sig_line = calculate_macd(recent_prices)
             sentiment = get_sentiment()
@@ -297,38 +295,85 @@ if st.button("Analyze"):
                 "Confidence (%)": confidence
             })
 
-            # Plot
+            # Plot with hover info
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=fd, y=fp, mode='lines+markers', name='Actual'))
+            # Actual prices
+            fig.add_trace(go.Scatter(
+                x=fd,
+                y=fp,
+                mode='lines+markers',
+                name='Actual',
+                hovertemplate=
+                    "<b>Date:</b> %{x}<br>"+
+                    "<b>Price:</b> %{y}<br>"+
+                    "<b>RSI:</b> %{customdata[0]:.2f}<br>"+
+                    "<b>MACD:</b> %{customdata[1]:.2f}<br>"+
+                    "<b>Signal Line:</b> %{customdata[2]:.2f}<br>"+
+                    "<extra></extra>",
+                customdata=np.column_stack([rsi[-len(fp):], macd_v[-len(fp):], sig_line[-len(fp):]])
+            ))
+            # Forecast next price
             fig.add_trace(go.Scatter(
                 x=[fd[-1], fd[-1]+timedelta(days=1)],
                 y=[fp[-1], next_p[0]],
-                mode='lines+markers', name='Forecast',
-                line=dict(dash='dash', color='red')
+                mode='lines+markers',
+                name='Forecast',
+                line=dict(dash='dash', color='red'),
+                hovertemplate=
+                    "<b>Date:</b> %{x}<br>"+
+                    "<b>Predicted Price:</b> %{y}<br>"+
+                    "<b>Sentiment:</b> "+str(round(sentiment,2))+"<br>"+
+                    "<b>Confidence:</b> "+str(confidence)+"%<br>"+
+                    "<extra></extra>"
             ))
             # Upper/lower bounds
             fig.add_trace(go.Scatter(
                 x=[fd[-1], fd[-1]+timedelta(days=1)],
                 y=[upper[0], upper[0]],
-                mode='lines', line=dict(dash='dot', color='orange'), name='Upper')
-            )
+                mode='lines',
+                line=dict(dash='dot', color='orange'),
+                name='Upper',
+                hoverinfo='skip'
+            ))
             fig.add_trace(go.Scatter(
                 x=[fd[-1], fd[-1]+timedelta(days=1)],
                 y=[lower[0], lower[0]],
-                mode='lines', line=dict(dash='dot', color='orange'), name='Lower')
-            )
+                mode='lines',
+                line=dict(dash='dot', color='orange'),
+                name='Lower',
+                hoverinfo='skip'
+            ))
 
-            col1, col2 = st.columns([3,1])
-            with col1:
-                st.subheader(f"{sym} Chart")
-                st.plotly_chart(fig)
-            with col2:
-                st.metric("Current Price", round(current_price,2))
-                st.metric("Signal", sig)
-                st.metric("Score", round(score,2))
-                st.metric("Win Rate (%)", win_rate)
-                st.metric("Change (%)", round(change_pct,2))
-                st.metric("Confidence (%)", confidence)
+            # ---------------------------
+            # Boxed Layout for Coin
+            # ---------------------------
+            with st.container():
+                st.markdown(
+                    f"""
+                    <div style="
+                        border: 2px solid #ccc; 
+                        border-radius: 10px; 
+                        padding: 15px; 
+                        margin-bottom: 20px;
+                        background-color: #f9f9f9;">
+                        <h3 style='margin-bottom:10px'>{sym}</h3>
+                    """, unsafe_allow_html=True
+                )
+
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.subheader("Price Chart")
+                    st.plotly_chart(fig, use_container_width=True)
+                with col2:
+                    st.subheader("Statistics")
+                    st.metric("Current Price", round(current_price,2))
+                    st.metric("Signal", sig)
+                    st.metric("Score", round(score,2))
+                    st.metric("Win Rate (%)", win_rate)
+                    st.metric("Change (%)", round(change_pct,2))
+                    st.metric("Confidence (%)", confidence)
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
         # Summary Table
         if summary_data:
