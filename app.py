@@ -28,7 +28,7 @@ if not firebase_admin._apps:
 # ---------------------------
 # 🔧 Config
 # ---------------------------
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XAIUSD","XRPUSDT","LUNAUSDT","MATICUSDT"]
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XAIUSD","XRPUSDT","LUNAUSDT","MATICUSDT"]  # DOGE removed
 TIMEFRAMES = {"1 Day":1,"3 Days":3,"5 Days":5,"1 Month":30}
 RSI_PERIOD = 14
 ARIMA_ORDER = (2,1,2)
@@ -251,12 +251,18 @@ if st.button("Analyze"):
         for sym in symbols:
             prices, dates = fetch_historical(sym)
             hr_prices, hr_dates = fetch_hourly(sym)
-            if len(hr_prices)>0:
-                prices=np.concatenate([prices, hr_prices])
-                dates=dates+hr_dates
-            cutoff = datetime.utcnow() - timedelta(days=TIMEFRAMES[timeframe])
-            fp = [p for d,p in zip(dates,prices) if d>=cutoff]
-            fd = [d for d in dates if d>=cutoff]
+            # Combine daily + hourly
+            all_prices = np.concatenate([prices, hr_prices]) if len(hr_prices)>0 else prices
+            all_dates = dates + hr_dates if len(hr_dates)>0 else dates
+            # Sort & remove duplicates
+            sorted_pairs = sorted(zip(all_dates, all_prices), key=lambda x: x[0])
+            seen = set()
+            fp, fd = [], []
+            for d,p in sorted_pairs:
+                if d not in seen:
+                    fd.append(d)
+                    fp.append(p)
+                    seen.add(d)
             if len(fp)<2: continue
 
             # Forecast
