@@ -10,24 +10,26 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from statsmodels.tsa.arima.model import ARIMA
 import firebase_admin
 from firebase_admin import credentials, db
+import streamlit as st
 
-# ---------------------------
-# 🔐 FIREBASE INIT
-# ---------------------------
 firebase_admin_initialized = False
-try:
-    firebase_dict = dict(st.secrets["firebase"])
-    firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
-    cred = credentials.Certificate(firebase_dict)
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred, {
-            "databaseURL": firebase_dict["databaseURL"]
-        })
+
+if not firebase_admin._apps:
+    try:
+        firebase_dict = dict(st.secrets["firebase"])
+        # Ensure correct newline formatting
+        firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
+        cred = credentials.Certificate(firebase_dict)
+        firebase_admin.initialize_app(cred, {"databaseURL": firebase_dict["databaseURL"]})
+        firebase_admin_initialized = True
+        st.success("Firebase initialized successfully.")
+    except Exception as e:
+        st.error(f"Firebase init failed: {type(e).__name__}: {e}")
+        import traceback
+        st.text(traceback.format_exc())
+else:
+    st.info("Firebase already initialized, skipping re-initialization.")
     firebase_admin_initialized = True
-except Exception as e:
-    st.error(f"Firebase init failed: {type(e).__name__}: {e}")
-    import traceback
-    st.text(traceback.format_exc())
 
 # ---------------------------
 # 📊 PRICE FETCHING (MULTI-SOURCE, MULTI-COIN)
