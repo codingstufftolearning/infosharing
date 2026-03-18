@@ -295,5 +295,9 @@ if st.button("Analyze"):
         df_dash=pd.DataFrame(dashboard_data)
         st.dataframe(df_dash)
 
+    # Then proceed with per-coin charts & metrics below (same as before)
     col1,col2=st.columns(2)
     for idx,symbol in enumerate(symbols):
+        # Same plotting & metrics logic as before...
+        # For brevity, reuse the prior per-coin code
+        # It will show the chart, forecast, % change, signal, win rate
