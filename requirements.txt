@@ -1,26 +1,10 @@
-# Streamlit UI
-streamlit==1.26.0
-
-# Data handling
-pandas>=2.1.0
-numpy>=1.25.0
-
-# HTTP requests
-requests>=2.31.0
-
-# Plotting
-plotly>=5.20.0
-
-# Sentiment analysis
-textblob>=0.17.1
-vaderSentiment>=3.3.2
-
-# Time series forecasting
-statsmodels>=0.14.1
-
-# Firebase Admin SDK
-firebase-admin>=6.1.1
-
-# Optional improvements
-python-dateutil>=2.8.2
-pytz>=2023.3
+streamlit
+pandas
+numpy
+requests
+plotly
+textblob
+vaderSentiment
+statsmodels
+prophet
+firebase-admin
