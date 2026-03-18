@@ -233,6 +233,12 @@ else:
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT"])
 timeframe = st.selectbox("Select Timeframe", list(TIMEFRAMES.keys()))
 
+# Optional Portfolio
+st.subheader("💰 Portfolio Tracker (Optional)")
+portfolio = {}
+for coin in symbols:
+    portfolio[coin] = st.number_input(f"Enter holdings for {coin}", min_value=0.0, step=0.01, key=f"hold_{coin}")
+
 # Helper: color-coded table
 def apply_colors(val):
     if val == "BUY":
@@ -247,6 +253,10 @@ def apply_colors(val):
         elif num < 0: return "color: red"
     except: pass
     return ""
+
+# Metric Tooltips
+def metric_with_tooltip(name, value, tooltip):
+    st.markdown(f"<span title='{tooltip}'>{name}: {value}</span>", unsafe_allow_html=True)
 
 if st.button("Analyze"):
     with st.spinner("Analyzing coins..."):
@@ -284,6 +294,7 @@ if st.button("Analyze"):
             change_pct = ((fp[-1]-fp[0])/fp[0])*100
             current_price = fp[-1]
             confidence = calculate_confidence(upper, lower, current_price)
+            portfolio_value = portfolio[sym]*current_price if sym in portfolio else 0
 
             summary_data.append({
                 "Coin": sym,
@@ -292,12 +303,12 @@ if st.button("Analyze"):
                 "Score": round(score,2),
                 "Win Rate (%)": win_rate,
                 "Change (%)": round(change_pct,2),
-                "Confidence (%)": confidence
+                "Confidence (%)": confidence,
+                "Portfolio Value": round(portfolio_value,2)
             })
 
             # Plot with hover info
             fig = go.Figure()
-            # Actual prices
             fig.add_trace(go.Scatter(
                 x=fd,
                 y=fp,
@@ -312,7 +323,6 @@ if st.button("Analyze"):
                     "<extra></extra>",
                 customdata=np.column_stack([rsi[-len(fp):], macd_v[-len(fp):], sig_line[-len(fp):]])
             ))
-            # Forecast next price
             fig.add_trace(go.Scatter(
                 x=[fd[-1], fd[-1]+timedelta(days=1)],
                 y=[fp[-1], next_p[0]],
@@ -326,7 +336,6 @@ if st.button("Analyze"):
                     "<b>Confidence:</b> "+str(confidence)+"%<br>"+
                     "<extra></extra>"
             ))
-            # Upper/lower bounds
             fig.add_trace(go.Scatter(
                 x=[fd[-1], fd[-1]+timedelta(days=1)],
                 y=[upper[0], upper[0]],
@@ -344,9 +353,7 @@ if st.button("Analyze"):
                 hoverinfo='skip'
             ))
 
-            # ---------------------------
             # Boxed Layout for Coin
-            # ---------------------------
             with st.container():
                 st.markdown(
                     f"""
@@ -366,12 +373,14 @@ if st.button("Analyze"):
                     st.plotly_chart(fig, use_container_width=True)
                 with col2:
                     st.subheader("Statistics")
-                    st.metric("Current Price", round(current_price,2))
-                    st.metric("Signal", sig)
-                    st.metric("Score", round(score,2))
-                    st.metric("Win Rate (%)", win_rate)
-                    st.metric("Change (%)", round(change_pct,2))
-                    st.metric("Confidence (%)", confidence)
+                    metric_with_tooltip("Current Price", round(current_price,2), "Latest fetched price")
+                    metric_with_tooltip("Signal", sig, "AI BUY/SELL/HOLD recommendation")
+                    metric_with_tooltip("Score", round(score,2), "Weighted sum of indicators")
+                    metric_with_tooltip("Win Rate (%)", win_rate, "Historical accuracy of past signals")
+                    metric_with_tooltip("Change (%)", round(change_pct,2), "Price change over selected timeframe")
+                    metric_with_tooltip("Confidence (%)", confidence, "Model confidence based on forecast interval")
+                    if portfolio[sym]>0:
+                        metric_with_tooltip("Portfolio Value", round(portfolio_value,2), f"Holdings: {portfolio[sym]} × Price")
 
                 st.markdown("</div>", unsafe_allow_html=True)
 
