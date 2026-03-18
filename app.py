@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import requests
@@ -11,8 +12,13 @@ from prophet import Prophet
 import firebase_admin
 from firebase_admin import credentials, db
 
+# =========================
+# 🔄 AUTO REFRESH (30 MIN)
+# =========================
+st_autorefresh(interval=1800000, key="refresh")
+
 # ---------------------------
-# 🔐 Firebase Initialization
+# 🔐 FIREBASE INIT
 # ---------------------------
 if not firebase_admin._apps:
     try:
@@ -26,20 +32,39 @@ if not firebase_admin._apps:
         st.error(f"Firebase Initialization Error: {e}")
 
 # ---------------------------
-# 🔧 Config
+# 📊 FETCH PRICE DATA
 # ---------------------------
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XAIUSD","XRPUSDT","LUNAUSDT","MATICUSDT"]  # DOGE removed
-TIMEFRAMES = {"1 Day":1,"3 Days":3,"5 Days":5,"1 Month":30}
-RSI_PERIOD = 14
-ARIMA_ORDER = (2,1,2)
-ROLLING_HOURS = 7*24
+def get_price_data(symbol="BTCUSDT", days=30):
+    prices, dates, errors = [], [], []
+    coin = symbol.replace("USDT","").lower()
+
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
+        data = requests.get(url, timeout=5).json()
+        if "prices" in data:
+            prices = [x[1] for x in data["prices"]]
+            dates = [datetime.fromtimestamp(x[0]/1000) for x in data["prices"]]
+            return np.array(prices), dates, errors
+    except Exception as e:
+        errors.append(str(e))
+
+    try:
+        url_cc = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol[:3]}&tsym=USD&limit={days-1}"
+        data_cc = requests.get(url_cc, timeout=5).json()
+        raw = data_cc.get("Data", {}).get("Data", [])
+        prices = [x["close"] for x in raw]
+        dates = [datetime.fromtimestamp(x["time"]) for x in raw]
+        return np.array(prices), dates, errors
+    except Exception as e:
+        errors.append(str(e))
+
+    return np.array([]), [], errors
 
 # ---------------------------
-# 📊 Data Fetching
+# 📊 HISTORICAL + FIREBASE
 # ---------------------------
-@st.cache_data(ttl=600)
-def fetch_historical(symbol="BTCUSDT", days=30):
-    prices, dates = [], []
+def get_historical_data(symbol="BTCUSDT"):
+    prices, dates, errors = [], [], []
     try:
         ref = db.reference(f"historical/{symbol}")
         data = ref.get() or {}
@@ -47,47 +72,43 @@ def fetch_historical(symbol="BTCUSDT", days=30):
             sorted_data = sorted(data.items(), key=lambda x: x[1]['time'])
             prices = [v["price"] for _,v in sorted_data]
             dates = [datetime.fromisoformat(v["time"]) for _,v in sorted_data]
-            return np.array(prices), dates
+            return np.array(prices), dates, errors
+    except Exception as e:
+        errors.append(str(e))
+
+    prices, dates, _ = get_price_data(symbol, 30)
+
+    try:
+        ref = db.reference(f"historical/{symbol}")
+        for i in range(len(prices)):
+            ref.push({"time": dates[i].isoformat(), "price": float(prices[i])})
     except:
         pass
-    # API fallback
-    coin = symbol.replace("USDT","").lower()
-    try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
-        data = requests.get(url, timeout=5).json()
-        prices = [x[1] for x in data.get("prices",[])]
-        dates = [datetime.fromtimestamp(x[0]/1000) for x in data.get("prices",[])]
-        try:
-            ref = db.reference(f"historical/{symbol}")
-            for i in range(len(prices)):
-                ref.push({"time": dates[i].isoformat(), "price": float(prices[i])})
-        except:
-            pass
-        return np.array(prices), dates
-    except:
-        return np.array([]), []
 
-@st.cache_data(ttl=300)
-def fetch_hourly(symbol="BTCUSDT", hours=72):
+    return np.array(prices), dates, errors
+
+# ---------------------------
+# ⏱️ HOURLY DATA
+# ---------------------------
+def get_hourly_data(symbol="BTCUSDT", hours=72):
     fsym = symbol.replace("USDT","")
     url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={hours-1}"
-    try:
-        data = requests.get(url, timeout=5).json()
-        prices = [x["close"] for x in data.get("Data", {}).get("Data",[])]
-        dates = [datetime.fromtimestamp(x["time"]) for x in data.get("Data", {}).get("Data",[])]
-        return np.array(prices), dates
-    except:
-        return np.array([]), []
+    data = requests.get(url, timeout=5).json()
+    prices, dates = [], []
+    for x in data.get("Data", {}).get("Data", []):
+        prices.append(x["close"])
+        dates.append(datetime.fromtimestamp(x["time"]))
+    return np.array(prices), dates
 
 # ---------------------------
-# 📈 Indicators
+# 📈 INDICATORS
 # ---------------------------
-def calculate_rsi(prices, period=RSI_PERIOD):
+def calculate_rsi(prices, period=14):
     delta = np.diff(prices)
-    gain = np.maximum(delta,0)
-    loss = np.abs(np.minimum(delta,0))
-    avg_gain = pd.Series(gain).rolling(period,min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(period,min_periods=1).mean()
+    gain = np.maximum(delta, 0)
+    loss = np.abs(np.minimum(delta, 0))
+    avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
     rs = avg_gain/(avg_loss+1e-9)
     rsi = 100 - (100/(1+rs))
     return np.concatenate([[50], rsi])
@@ -100,29 +121,28 @@ def calculate_macd(prices):
     return macd.values, signal.values
 
 # ---------------------------
-# 📰 Sentiment
+# 📰 SENTIMENT
 # ---------------------------
-@st.cache_data(ttl=600)
 def get_sentiment():
     try:
         url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
         data = requests.get(url, timeout=5).json()
         scores=[]
         for a in data.get("Data", [])[:8]:
-            text = f"{a.get('title','')}. {a.get('body','')[:150]}"
+            text = f"{a.get('title','')}"
             vader = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
             blob = TextBlob(text).sentiment.polarity
-            scores.append((vader+blob)/2)
+            scores.append((vader + blob)/2)
         return np.mean(scores) if scores else 0
     except:
         return 0
 
 # ---------------------------
-# 🔮 Forecasting
+# 🔮 FORECAST
 # ---------------------------
 def arima_forecast(prices, steps):
     try:
-        model = ARIMA(prices, order=ARIMA_ORDER)
+        model = ARIMA(prices, order=(2,1,2))
         model_fit = model.fit()
         return list(model_fit.forecast(steps=steps))
     except:
@@ -138,14 +158,14 @@ def prophet_forecast(dates, prices, steps):
             f["yhat_upper"].tail(steps).values,
             f["yhat_lower"].tail(steps).values)
 
-def hybrid_forecast(prices, dates, steps=1):
+def hybrid_forecast(prices, dates, steps):
     ar = arima_forecast(prices, steps)
     pr, upper, lower = prophet_forecast(dates, prices, steps)
-    combined = [(a+p)/2 for a,p in zip(ar,pr)]
+    combined = [(a+p)/2 for a,p in zip(ar, pr)]
     return combined, upper, lower
 
 # ---------------------------
-# 🧠 Signals
+# 🧠 AI LOGIC
 # ---------------------------
 def load_weights():
     ref=db.reference("weights")
@@ -174,176 +194,173 @@ def update_weights(symbol, weights):
     data=list((ref.get() or {}).values())
     if len(data)<2: return weights
     prev,curr=data[-2],data[-1]
-    if prev.get("signal","HOLD")=="HOLD": return weights
     actual_up = curr["price"]>prev["price"]
     lr=0.03
     for key in weights:
         contrib=prev.get("contributions",{}).get(key,0)
         if contrib==0: continue
-        if (contrib>0 and actual_up) or (contrib<0 and not actual_up): weights[key]*=(1+lr)
-        else: weights[key]*=(1-lr)
+        if (contrib>0 and actual_up) or (contrib<0 and not actual_up):
+            weights[key]*=(1+lr)
+        else:
+            weights[key]*=(1-lr)
         weights[key]=max(0.2,min(weights[key],3))
     return weights
 
 def save_prediction(symbol, price, pred, sig, contrib):
     ref=db.reference(f"history/{symbol}")
-    ref.push({"time":datetime.utcnow().isoformat(),"price":float(price),
-              "predicted":float(pred),"signal":sig,"contributions":contrib})
+    ref.push({
+        "time":datetime.utcnow().isoformat(),
+        "price":float(price),
+        "predicted":float(pred),
+        "signal":sig,
+        "contributions":contrib
+    })
 
 def calculate_win_rate(symbol):
     ref=db.reference(f"history/{symbol}")
     data=list((ref.get() or {}).values())
-    valid_data = [d for d in data if "price" in d]
-    if len(valid_data) < 2: return 0
     wins,total=0,0
-    for i in range(len(valid_data)-1):
-        curr,nxt=valid_data[i],valid_data[i+1]
+    for i in range(len(data)-1):
+        curr,nxt=data[i],data[i+1]
         sig=curr.get("signal","HOLD")
-        cp,nxt_p = curr.get("price",0), nxt.get("price",0)
-        if sig=="BUY" and nxt_p>cp: wins+=1
-        elif sig=="SELL" and nxt_p<cp: wins+=1
+        cp=curr.get("price",0); np_=nxt.get("price",0)
+        if sig=="BUY" and np_>cp: wins+=1
+        elif sig=="SELL" and np_<cp: wins+=1
         total+=1
     return round((wins/total)*100,2) if total>0 else 0
 
-def calculate_confidence(upper, lower, last_price):
-    conf = max(0, min(1, 1 - (upper[0] - lower[0])/last_price))
-    return round(conf*100,2)
+def calculate_confidence(upper, lower, price):
+    return round(max(0,min(1,1-(upper-lower)/price))*100,2)
 
-# ---------------------------
-# 🎨 Streamlit UI
-# ---------------------------
-st.title("🚀 AI Crypto Dashboard")
+# =========================
+# 🚀 BACKGROUND COLLECTOR
+# =========================
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
 
-# Portfolio Input Collapsible
-st.subheader("💰 Portfolio Tracker (Optional)")
-portfolio = {}
-portfolio_buy = {}
-with st.expander("Enter Holdings & Buy Price"):
-    for coin in COINS:
-        portfolio[coin] = st.number_input(f"Holdings for {coin}", min_value=0.0, step=0.01, key=f"hold_{coin}")
-        portfolio_buy[coin] = st.number_input(f"Buy Price for {coin}", min_value=0.0, step=0.01, key=f"buy_{coin}")
+for sym in COINS:
+    prices, dates, _ = get_historical_data(sym)
+    if len(prices) < 2:
+        continue
 
-symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT"])
-timeframe = st.selectbox("Select Timeframe", list(TIMEFRAMES.keys()))
+    hr_prices, hr_dates = get_hourly_data(sym)
+    if len(hr_prices) > 0:
+        prices = np.concatenate([prices, hr_prices])
+        dates = dates + hr_dates
 
-# Color and UI helpers
-def apply_colors(val):
-    if val == "BUY": return "background-color: #b6fcb6; color: black"
-    elif val == "SELL": return "background-color: #fcb6b6; color: black"
-    elif val == "HOLD": return "background-color: #fff79a; color: black"
-    try:
-        num = float(val)
-        if num > 0: return "color: green"
-        elif num < 0: return "color: red"
-    except: pass
-    return ""
+    next_p, upper, lower = hybrid_forecast(prices, dates, 1)
 
-def metric_with_tooltip(name, value, tooltip):
-    st.markdown(f"<span title='{tooltip}'>{name}: {value}</span>", unsafe_allow_html=True)
+    rsi = calculate_rsi(prices)
+    macd_v, sig_line = calculate_macd(prices)
+    sentiment = get_sentiment()
+    weights = load_weights()
 
-# ---------------------------
-# Analyze Button
-# ---------------------------
-if st.button("Analyze"):
-    with st.spinner("Analyzing coins..."):
-        summary_data=[]
-        coin_details=[]
-        for sym in symbols:
-            prices, dates = fetch_historical(sym)
-            hr_prices, hr_dates = fetch_hourly(sym)
-            # Combine daily + hourly
-            all_prices = np.concatenate([prices, hr_prices]) if len(hr_prices)>0 else prices
-            all_dates = dates + hr_dates if len(hr_dates)>0 else dates
-            # Sort & remove duplicates
-            sorted_pairs = sorted(zip(all_dates, all_prices), key=lambda x: x[0])
-            seen = set()
-            fp, fd = [], []
-            for d,p in sorted_pairs:
-                if d not in seen:
-                    fd.append(d)
-                    fp.append(p)
-                    seen.add(d)
-            if len(fp)<2: continue
+    sig, score, con = smart_signal(prices, rsi, macd_v, sig_line, sentiment, weights)
 
-            # Forecast
-            next_p, upper, lower = hybrid_forecast(fp, fd, 1)
+    save_prediction(sym, prices[-1], next_p[0], sig, con)
 
-            # Indicators
-            recent_prices = fp[-ROLLING_HOURS:] if len(fp)>ROLLING_HOURS else fp
-            rsi = calculate_rsi(recent_prices)
-            macd_v, sig_line = calculate_macd(recent_prices)
-            sentiment = get_sentiment()
-            weights = load_weights()
+    weights = update_weights(sym, weights)
+    save_weights(weights)
 
-            # Signal
-            sig, score, contrib = smart_signal(recent_prices, rsi, macd_v, sig_line, sentiment, weights)
-            save_prediction(sym, fp[-1], next_p[0], sig, contrib)
-            weights = update_weights(sym, weights)
-            save_weights(weights)
+# =========================
+# 🎨 UI
+# =========================
+st.title("🚀 AI Crypto Bot")
 
-            # Metrics
-            win_rate = calculate_win_rate(sym)
-            change_pct = ((fp[-1]-fp[0])/fp[0])*100
-            current_price = fp[-1]
-            confidence = calculate_confidence(upper, lower, current_price)
-            portfolio_value = portfolio[sym]*current_price
-            profit_loss = portfolio_value - (portfolio[sym]*portfolio_buy[sym])
+portfolio={}
+buy={}
+with st.expander("💰 Portfolio"):
+    for c in COINS:
+        portfolio[c]=st.number_input(f"{c} amount",0.0,key=f"h{c}")
+        buy[c]=st.number_input(f"{c} buy price",0.0,key=f"b{c}")
 
-            summary_data.append({
-                "Coin": sym,
-                "Current Price": round(current_price,2),
-                "Signal": sig,
-                "Score": round(score,2),
-                "Win Rate (%)": win_rate,
-                "Change (%)": round(change_pct,2),
-                "Confidence (%)": confidence,
-                "Portfolio Value": round(portfolio_value,2),
-                "P/L": round(profit_loss,2)
-            })
+symbols=st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=fd, y=fp, mode='lines+markers', name=f"{sym} Price"))
-            fig.add_trace(go.Scatter(
-                x=[fd[-1], fd[-1]+timedelta(days=1)],
-                y=[fp[-1], next_p[0]],
-                mode='lines+markers',
-                name='Forecast',
-                line=dict(dash='dash', color='red')
-            ))
+summary_data=[]
 
-            coin_details.append((sym, fig, current_price, sig, score, win_rate, change_pct, confidence, portfolio_value, profit_loss))
+for sym in symbols:
+    prices, dates, _ = get_historical_data(sym)
+    hr_prices, hr_dates = get_hourly_data(sym)
 
-        # Summary Table at Top
-        if summary_data:
-            st.subheader("📊 Summary Table")
-            df_summary = pd.DataFrame(summary_data)
-            st.dataframe(df_summary.style.applymap(apply_colors))
+    if len(hr_prices)>0:
+        prices=np.concatenate([prices,hr_prices])
+        dates=dates+hr_dates
 
-        # Per-Coin Charts & Stats
-        for (sym, fig, current_price, sig, score, win_rate, change_pct, confidence, portfolio_value, profit_loss) in coin_details:
-            with st.container():
-                st.markdown(f"""
-                    <div style="
-                        border:1px solid #ccc;
-                        border-radius:10px;
-                        padding:15px;
-                        margin-bottom:15px;
-                        background-color:#f7f7f7;">
-                        <h3 style='margin-bottom:10px'>{sym} - ${round(current_price,2)}</h3>
-                    """, unsafe_allow_html=True)
-                col1, col2 = st.columns([3,1])
-                with col1:
-                    st.plotly_chart(fig, use_container_width=True)
-                with col2:
-                    metric_with_tooltip("Signal", sig, "BUY/SELL/HOLD")
-                    metric_with_tooltip("Score", round(score,2), "Weighted indicator score")
-                    metric_with_tooltip("Win Rate (%)", win_rate, "Historical signal accuracy")
-                    metric_with_tooltip("Change (%)", round(change_pct,2), "Price change in timeframe")
-                    metric_with_tooltip("Confidence (%)", confidence, "Forecast confidence")
-                    if portfolio[sym]>0:
-                        with st.expander("Portfolio Info"):
-                            metric_with_tooltip("Holdings", portfolio[sym], "Number of coins held")
-                            metric_with_tooltip("Buy Price", portfolio_buy[sym], "Price purchased")
-                            metric_with_tooltip("Current Value", round(portfolio_value,2), "Current value")
-                            metric_with_tooltip("P/L", round(profit_loss,2), "Profit/Loss")
-                st.markdown("</div>", unsafe_allow_html=True)
+    # FIXED CHART
+    combined = sorted(zip(dates, prices), key=lambda x: x[0])
+    seen=set(); fd=[]; fp=[]
+    for d,p in combined:
+        if d not in seen:
+            fd.append(d); fp.append(p); seen.add(d)
+
+    if len(fp)<2: continue
+
+    next_p, upper, lower = hybrid_forecast(fp, fd, 1)
+
+    rsi=calculate_rsi(fp)
+    macd_v, sig_line=calculate_macd(fp)
+    sentiment=get_sentiment()
+    weights=load_weights()
+
+    sig,score,con=smart_signal(fp,rsi,macd_v,sig_line,sentiment,weights)
+
+    save_prediction(sym,fp[-1],next_p[0],sig,con)
+
+    weights=update_weights(sym,weights)
+    save_weights(weights)
+
+    wr=calculate_win_rate(sym)
+    conf=calculate_confidence(upper[0],lower[0],fp[-1])
+
+    summary_data.append({
+        "Coin":sym,
+        "Price":fp[-1],
+        "Signal":sig,
+        "Score":score,
+        "WinRate":wr,
+        "Confidence":conf
+    })
+
+# =========================
+# 📊 SUMMARY TOP
+# =========================
+st.subheader("📊 Summary")
+st.dataframe(pd.DataFrame(summary_data))
+
+# =========================
+# 📈 DETAILS
+# =========================
+for sym in symbols:
+    prices, dates, _ = get_historical_data(sym)
+    hr_prices, hr_dates = get_hourly_data(sym)
+
+    if len(hr_prices)>0:
+        prices=np.concatenate([prices,hr_prices])
+        dates=dates+hr_dates
+
+    combined = sorted(zip(dates, prices), key=lambda x: x[0])
+    fd=[x[0] for x in combined]
+    fp=[x[1] for x in combined]
+
+    next_p, _, _ = hybrid_forecast(fp, fd, 1)
+
+    st.markdown(f"### {sym} — Current Price: ${round(fp[-1],2)}")
+
+    col1,col2=st.columns([3,1])
+
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=fd,y=fp,name=sym))
+    fig.add_trace(go.Scatter(
+        x=[fd[-1],fd[-1]+timedelta(days=1)],
+        y=[fp[-1],next_p[0]],
+        name="Forecast",line=dict(dash="dash")
+    ))
+
+    with col1:
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        color={"BUY":"green","SELL":"red","HOLD":"#777777"}
+        st.markdown(
+            f"<div style='padding:8px;border-radius:8px;background:{color[sig]};color:white;text-align:center;font-weight:bold'>{sig}</div>",
+            unsafe_allow_html=True
+        )
