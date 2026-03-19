@@ -25,9 +25,7 @@ if not firebase_admin._apps:
         firebase_dict = dict(st.secrets["firebase"])
         firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
         cred = credentials.Certificate(firebase_dict)
-        firebase_admin.initialize_app(cred, {
-            "databaseURL": firebase_dict["databaseURL"]
-        })
+        firebase_admin.initialize_app(cred, {"databaseURL": firebase_dict["databaseURL"]})
     except Exception as e:
         st.error(f"Firebase Initialization Error: {e}")
 
@@ -229,16 +227,12 @@ timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day",
 COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
-# =========================
-# MAIN DISPLAY LOOP
-# =========================
 for sym in symbols:
     data, source = get_ohlc(sym, timeframe)
     if data is None:
         st.error(f"{sym} failed to fetch data from all sources")
         continue
     fd,o,h,l,c,v = data
-
     next_p = arima_forecast(c,1)[0]
     rsi = calculate_rsi(c)
     macd_v, sig_line = calculate_macd(c)
@@ -246,22 +240,26 @@ for sym in symbols:
     weights = load_weights()
     sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
     wr = calculate_win_rate(sym)
-    conf = calculate_confidence(max(c), min(c), c[-1])  # simplified confidence
+    conf = calculate_confidence(max(c), min(c), c[-1])
 
     # Two-column layout
     col_chart, col_stats = st.columns([3,1])
 
+    # --- Chart ---
     with col_chart:
         color = "green" if next_p>c[-1] else "red"
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=fd, y=c, mode="lines", name="Price", line=dict(color="gray", dash="dash")))
-        fig.add_trace(go.Scatter(x=[fd[-1],fd[-1]+timedelta(hours=1)], y=[c[-1],next_p], mode="lines", name="Forecast", line=dict(color=color, width=3)))
+        fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
+                                     increasing_line_color='green',
+                                     decreasing_line_color='red',
+                                     name="Price"))
+        fig.add_trace(go.Scatter(x=[fd[-1],fd[-1]+timedelta(hours=1)],
+                                 y=[c[-1],next_p],
+                                 mode="lines", line=dict(color=color, width=3),
+                                 name="Forecast"))
         fig.update_layout(
             dragmode=False,
-            xaxis=dict(fixedrange=True),
-            yaxis=dict(fixedrange=True),
             margin=dict(l=20,r=20,t=30,b=20),
-            showlegend=False,
             updatemenus=[dict(type="buttons", y=1, x=1.05, showactive=False, buttons=[
                 dict(label="+", method="relayout", args=["xaxis.range[1]", fd[-1]]),
                 dict(label="-", method="relayout", args=["xaxis.range[0]", fd[0]])
@@ -270,15 +268,26 @@ for sym in symbols:
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         st.caption(f"Source: {source}")
 
+    # --- Stats Panel ---
+    tooltip = {
+        "Signal":"AI trading signal: BUY, SELL, or HOLD based on indicators",
+        "Score":"Aggregated score from RSI, MACD, Trend, Sentiment",
+        "WinRate":"Historical accuracy percentage of previous signals",
+        "Confidence":"Forecast reliability percentage based on upper/lower bounds",
+        "RSI":"Relative Strength Index (<30 oversold, >70 overbought)",
+        "MACD":"MACD vs Signal line; trend momentum indicator",
+        "Sentiment":"Average sentiment score from recent news"
+    }
+
     with col_stats:
         st.markdown(f"### {sym} Stats")
-        st.markdown(f"**Signal:** {sig}")
-        st.markdown(f"**Score:** {score}")
-        st.markdown(f"**WinRate:** {wr}%")
-        st.markdown(f"**Confidence:** {conf}%")
-        st.markdown(f"**RSI:** {round(rsi[-1],2)}")
-        st.markdown(f"**MACD:** {round(macd_v[-1],2)} / {round(sig_line[-1],2)}")
-        st.markdown(f"**Sentiment:** {round(sentiment,2)}")
+        st.markdown(f"<span title='{tooltip['Signal']}'>**Signal:**</span> {sig}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {wr}%", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
 
 # =========================
 # 🧰 DEBUG PANEL
