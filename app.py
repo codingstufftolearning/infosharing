@@ -286,7 +286,7 @@ for sym in symbols:
         weights = load_weights()
         sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
         wr = 0  # optional historical winrate
-        conf = calculate_confidence(max(c), min(c), c[-1])
+        conf = round(max(0,min(1,1-(max(c)-min(c))/c[-1]))*100,2)
 
         # Forecast
         future_dates_arima=[]
@@ -301,10 +301,20 @@ for sym in symbols:
             future_dates_prophet = np.array(future_dates_arima)
             future_prices_prophet = np.array(future_prices_arima)
 
-        # Ensure NumPy arrays
+        # NumPy arrays
         future_prices_arima = np.array(future_prices_arima)
         future_prices_prophet = np.array(future_prices_prophet)
         future_prices = (future_prices_arima + future_prices_prophet)/2
+
+        # ================================
+        # 🔹 Smooth Forecast
+        alpha = 0.3
+        smoothed_forecast = [future_prices[0]]
+        for i in range(1, len(future_prices)):
+            smoothed_forecast.append(alpha*future_prices[i] + (1-alpha)*smoothed_forecast[-1])
+        future_prices = np.array(smoothed_forecast)
+        # ================================
+
         future_dates = np.array(future_dates_arima)
 
         # Coin Box
