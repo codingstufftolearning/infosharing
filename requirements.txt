@@ -1,4 +1,5 @@
 streamlit
+streamlit-autorefresh
 pandas
 numpy
 requests
@@ -8,4 +9,5 @@ vaderSentiment
 statsmodels
 prophet
 firebase-admin
-streamlit-autorefresh
+scikit-learn
+websocket-client
