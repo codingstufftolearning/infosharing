@@ -106,22 +106,28 @@ def get_ohlc(symbol, timeframe):
     return None, "None"
 
 # =========================
-# 📈 INDICATORS
+# 📈 INDICATORS (safe for short data)
 # =========================
 def calculate_rsi(prices, period=14):
+    prices = np.array(prices)
+    if len(prices) < period + 1:
+        return np.array([50]*len(prices))  # fallback
     delta = np.diff(prices)
     gain = np.maximum(delta, 0)
     loss = np.abs(np.minimum(delta, 0))
     avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
     avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
-    rs = avg_gain/(avg_loss+1e-9)
-    return np.concatenate([[50], 100-(100/(1+rs))])
+    rs = avg_gain / (avg_loss + 1e-9)
+    return np.concatenate([[50], 100 - (100 / (1 + rs))])
 
 def calculate_macd(prices):
-    exp1 = pd.Series(prices).ewm(span=12,adjust=False).mean()
-    exp2 = pd.Series(prices).ewm(span=26,adjust=False).mean()
+    prices = np.array(prices)
+    if len(prices) < 26:
+        return np.zeros(len(prices)), np.zeros(len(prices))
+    exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
+    exp2 = pd.Series(prices).ewm(span=26, adjust=False).mean()
     macd = exp1 - exp2
-    signal = macd.ewm(span=9,adjust=False).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
     return macd.values, signal.values
 
 # =========================
@@ -154,7 +160,6 @@ def prophet_forecast(fd, c, step_delta):
     df = pd.DataFrame({"ds": fd, "y": c})
     m = Prophet(daily_seasonality=True, weekly_seasonality=False, yearly_seasonality=False)
     m.fit(df)
-    # Generate future dates until 23:59
     last_date = fd[-1]
     end_of_day = datetime.combine(last_date.date(), time(23,59))
     future_dates = []
@@ -237,7 +242,7 @@ tooltip = {
     "Sentiment":"Average sentiment score from recent news"
 }
 
-# Forecast step mapping based on timeframe
+# Forecast step mapping
 step_mapping = {
     "15 Min": timedelta(minutes=15),
     "Hourly": timedelta(hours=1),
@@ -256,7 +261,8 @@ for sym in symbols:
             debug_info.append(f"{sym}: Failed to fetch data from all sources.")
             continue
         fd,o,h,l,c,v = data
-        if len(c)<2:
+        c = np.array(c)
+        if len(c) < 14:  # minimum for RSI
             debug_info.append(f"{sym}: Insufficient data for analysis.")
             continue
         rsi = calculate_rsi(c)
@@ -281,7 +287,7 @@ for sym in symbols:
             future_dates_prophet = future_dates_arima
             future_prices_prophet = future_prices_arima
 
-        # Combine both forecasts (average)
+        # Combine forecasts
         future_prices = (future_prices_arima + future_prices_prophet)/2
         future_dates = future_dates_arima
 
