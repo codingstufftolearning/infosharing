@@ -97,7 +97,7 @@ def get_ohlc(symbol, timeframe):
     mapping = {
         "15 Min": ("15m", 96),
         "Hourly": ("1h", 48),
-        "Daily": ("1d", 100),   # increased limit for enough data
+        "Daily": ("1d", 100),
         "3-Day": ("3d", 60)
     }
     interval, limit = mapping[timeframe]
@@ -107,19 +107,19 @@ def get_ohlc(symbol, timeframe):
     return None, "None"
 
 # =========================
-# 📈 INDICATORS (safe for short data)
+# 📈 INDICATORS
 # =========================
 def calculate_rsi(prices, period=14):
     prices = np.array(prices)
-    if len(prices) < period + 1:
-        return np.array([50]*len(prices))  # fallback
+    if len(prices) < period+1:
+        return np.array([50]*len(prices))
     delta = np.diff(prices)
-    gain = np.maximum(delta, 0)
-    loss = np.abs(np.minimum(delta, 0))
-    avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
+    gain = np.maximum(delta,0)
+    loss = np.abs(np.minimum(delta,0))
+    avg_gain = pd.Series(gain).rolling(period,min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(period,min_periods=1).mean()
     rs = avg_gain / (avg_loss + 1e-9)
-    return np.concatenate([[50], 100 - (100 / (1 + rs))])
+    return np.concatenate([[50], 100-(100/(1+rs))])
 
 def calculate_macd(prices):
     prices = np.array(prices)
@@ -143,13 +143,13 @@ def get_sentiment():
             text = a.get("title","")
             vader = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
             blob = TextBlob(text).sentiment.polarity
-            scores.append((vader + blob)/2)
+            scores.append((vader+blob)/2)
         return np.mean(scores) if scores else 0
     except:
         return 0
 
 # =========================
-# 🔮 FORECAST FUNCTIONS
+# 🔮 FORECAST
 # =========================
 def arima_forecast(prices, steps):
     try:
@@ -172,7 +172,7 @@ def prophet_forecast(fd, c, step_delta):
         return [], []
     future_df = pd.DataFrame({"ds": future_dates})
     forecast = m.predict(future_df)
-    return future_dates, forecast["yhat"].values
+    return np.array(future_dates), np.array(forecast["yhat"].values)
 
 # =========================
 # 🧠 AI LOGIC
@@ -181,6 +181,9 @@ def load_weights():
     ref = db.reference("weights")
     data = ref.get() or {}
     return data if data else {"rsi":1,"macd":1,"trend":1,"sentiment":1}
+
+def save_weights(weights):
+    db.reference("weights").set(weights)
 
 def smart_signal(prices,rsi,macd,signal,sentiment,weights):
     if len(macd)==0 or len(signal)==0:
@@ -198,21 +201,33 @@ def smart_signal(prices,rsi,macd,signal,sentiment,weights):
     elif score<=-3: return "SELL",score,contrib
     return "HOLD",score,contrib
 
-def calculate_win_rate(symbol):
+def update_weights(symbol, weights):
     ref=db.reference(f"history/{symbol}")
     data=list((ref.get() or {}).values())
-    wins,total=0,0
-    for i in range(len(data)-1):
-        curr,nxt=data[i],data[i+1]
-        sig=curr.get("signal","HOLD")
-        cp=curr.get("price",0); np_=nxt.get("price",0)
-        if sig=="BUY" and np_>cp: wins+=1
-        elif sig=="SELL" and np_<cp: wins+=1
-        total+=1
-    return round((wins/total)*100,2) if total>0 else 0
+    if len(data)<2: return weights
+    prev, curr = data[-2], data[-1]
+    actual_up = curr["price"]>prev["price"]
+    lr=0.03
+    for key in weights:
+        contrib=prev.get("contributions",{}).get(key,0)
+        if contrib==0: continue
+        if (contrib>0 and actual_up) or (contrib<0 and not actual_up):
+            weights[key]*=(1+lr)
+        else:
+            weights[key]*=(1-lr)
+        weights[key]=max(0.2,min(weights[key],3))
+    save_weights(weights)
+    return weights
 
-def calculate_confidence(upper, lower, price):
-    return round(max(0,min(1,1-(upper-lower)/price))*100,2)
+def save_prediction(symbol, price, pred, sig, contrib):
+    ref=db.reference(f"history/{symbol}")
+    ref.push({
+        "time":datetime.utcnow().isoformat(),
+        "price":float(price),
+        "predicted":float(pred),
+        "signal":sig,
+        "contributions":contrib
+    })
 
 # =========================
 # 🎨 UI
@@ -243,7 +258,6 @@ tooltip = {
     "Sentiment":"Average sentiment score from recent news"
 }
 
-# Forecast step mapping
 step_mapping = {
     "15 Min": timedelta(minutes=15),
     "Hourly": timedelta(hours=1),
@@ -252,7 +266,7 @@ step_mapping = {
 }
 forecast_step = step_mapping[timeframe]
 
-debug_info = []
+debug_info=[]
 
 for sym in symbols:
     try:
@@ -262,53 +276,47 @@ for sym in symbols:
             continue
         fd,o,h,l,c,v = data
         c = np.array(c)
-        if len(c) < 14:  # minimum for RSI
+        if len(c)<2:
             debug_info.append(f"{sym}: Insufficient data for analysis.")
             continue
+
         rsi = calculate_rsi(c)
         macd_v, sig_line = calculate_macd(c)
         sentiment = get_sentiment()
         weights = load_weights()
         sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
-        wr = calculate_win_rate(sym)
+        wr = 0  # optional historical winrate
         conf = calculate_confidence(max(c), min(c), c[-1])
 
-        # ARIMA forecast
-        future_dates_arima = []
+        # Forecast
+        future_dates_arima=[]
         curr = fd[-1] + forecast_step
         while curr <= datetime.combine(fd[-1].date(), time(23,59)):
             future_dates_arima.append(curr)
-            curr += forecast_step
+            curr+=forecast_step
         future_prices_arima = arima_forecast(c, len(future_dates_arima))
 
-        # Prophet forecast
         future_dates_prophet, future_prices_prophet = prophet_forecast(fd, c, forecast_step)
         if len(future_dates_prophet)==0:
-            future_dates_prophet = future_dates_arima
-            future_prices_prophet = future_prices_arima
+            future_dates_prophet = np.array(future_dates_arima)
+            future_prices_prophet = np.array(future_prices_arima)
 
-        # Combine forecasts
+        # Ensure NumPy arrays
+        future_prices_arima = np.array(future_prices_arima)
+        future_prices_prophet = np.array(future_prices_prophet)
         future_prices = (future_prices_arima + future_prices_prophet)/2
-        future_dates = future_dates_arima
+        future_dates = np.array(future_dates_arima)
 
         # Coin Box
         with st.container():
-            st.markdown(
-                f"<div style='border:1px solid white; padding:10px; border-radius:8px; margin-bottom:10px;'>",
-                unsafe_allow_html=True
-            )
+            st.markdown(f"<div style='border:1px solid white; padding:10px; border-radius:8px; margin-bottom:10px;'>", unsafe_allow_html=True)
             st.markdown(f"### {sym}")
 
-            # Chart + Stats Layout
             col_chart, col_stats = st.columns([3,1])
-
-            # --- Chart ---
             with col_chart:
-                fig = go.Figure()
+                fig=go.Figure()
                 fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
-                                             increasing_line_color='green',
-                                             decreasing_line_color='red',
-                                             name="Price"))
+                                             increasing_line_color='green', decreasing_line_color='red', name="Price"))
                 fig.add_trace(go.Scatter(
                     x=future_dates, y=future_prices,
                     mode="lines+markers",
@@ -316,32 +324,30 @@ for sym in symbols:
                     marker=dict(size=6, symbol="circle"),
                     name="Forecast"
                 ))
-                fig.update_layout(
-                    dragmode=False,
-                    margin=dict(l=20,r=20,t=30,b=20)
-                )
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                fig.update_layout(dragmode=False, margin=dict(l=20,r=20,t=30,b=20))
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False})
                 st.caption(f"Source: {source}")
 
-            # --- Stats Panel ---
             with col_stats:
                 st.markdown(f"<span title='{tooltip['Signal']}'>**Signal:**</span> {sig}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
-                st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {wr}%", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
 
-                # Portfolio P/L
                 if sym in portfolio:
                     info = portfolio[sym]
-                    profit_loss = (c[-1]-info["buy_price"])*info["amount"]
-                    pl_color = "green" if profit_loss>=0 else "red"
-                    st.markdown(f"<span>**Portfolio P/L:**</span> <span style='color:{pl_color}'>${profit_loss:.2f}</span>", unsafe_allow_html=True)
+                    pl = (c[-1]-info["buy_price"])*info["amount"]
+                    color = "green" if pl>=0 else "red"
+                    st.markdown(f"<span>**Portfolio P/L:**</span> <span style='color:{color}'>${pl:.2f}</span>", unsafe_allow_html=True)
 
             st.markdown("</div>", unsafe_allow_html=True)
-            debug_info.append(f"{sym}: min={min(c)}, max={max(c)}, last={c[-1]}")
+
+        # Save for dynamic learning
+        save_prediction(sym, c[-1], future_prices[-1], sig, con)
+        weights = update_weights(sym, weights)
+        debug_info.append(f"{sym}: min={min(c)}, max={max(c)}, last={c[-1]}")
 
     except Exception as e:
         debug_info.append(f"{sym}: Exception occurred - {e}")
