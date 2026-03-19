@@ -17,91 +17,97 @@ from firebase_admin import credentials, db
 # =========================
 st_autorefresh(interval=1800000, key="refresh")
 
-# ---------------------------
+# =========================
 # 🔐 FIREBASE INIT
-# ---------------------------
+# =========================
 if not firebase_admin._apps:
     try:
         firebase_dict = dict(st.secrets["firebase"])
         firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
         cred = credentials.Certificate(firebase_dict)
-        firebase_admin.initialize_app(cred, {
-            "databaseURL": firebase_dict["databaseURL"]
-        })
+        firebase_admin.initialize_app(cred, {"databaseURL": firebase_dict["databaseURL"]})
     except Exception as e:
         st.error(f"Firebase Initialization Error: {e}")
 
-# ---------------------------
-# 📊 FETCH PRICE DATA
-# ---------------------------
-def get_price_data(symbol="BTCUSDT", days=30):
-    prices, dates, errors = [], [], []
-    coin = symbol.replace("USDT","").lower()
-    # Coingecko
+# =========================
+# 📊 DATA FETCH FUNCTIONS
+# =========================
+def get_ohlc_binance(symbol, interval, limit):
     try:
-        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days={days}"
-        data = requests.get(url, timeout=5).json()
-        if "prices" in data:
-            prices = [x[1] for x in data["prices"]]
-            dates = [datetime.fromtimestamp(x[0]/1000) for x in data["prices"]]
-            return np.array(prices), dates, errors
-    except Exception as e:
-        errors.append(str(e))
-    # CryptoCompare as backup
-    try:
-        url_cc = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={symbol[:3]}&tsym=USD&limit={days-1}"
-        data_cc = requests.get(url_cc, timeout=5).json()
-        raw = data_cc.get("Data", {}).get("Data", [])
-        prices = [x["close"] for x in raw]
-        dates = [datetime.fromtimestamp(x["time"]) for x in raw]
-        return np.array(prices), dates, errors
-    except Exception as e:
-        errors.append(str(e))
-    return np.array([]), [], errors
-
-# ---------------------------
-# 📊 HISTORICAL + FIREBASE
-# ---------------------------
-def get_historical_data(symbol="BTCUSDT"):
-    prices, dates, errors = [], [], []
-    try:
-        ref = db.reference(f"historical/{symbol}")
-        data = ref.get() or {}
-        if data:
-            sorted_data = sorted(data.items(), key=lambda x: x[1]['time'])
-            prices = [v["price"] for _,v in sorted_data]
-            dates = [datetime.fromisoformat(v["time"]) for _,v in sorted_data]
-            return np.array(prices), dates, errors
-    except Exception as e:
-        errors.append(str(e))
-    prices, dates, _ = get_price_data(symbol, 30)
-    try:
-        ref = db.reference(f"historical/{symbol}")
-        for i in range(len(prices)):
-            ref.push({"time": dates[i].isoformat(), "price": float(prices[i])})
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        data = requests.get(url, params=params, timeout=5).json()
+        d,o,h,l,c,v = [],[],[],[],[],[]
+        for k in data:
+            d.append(datetime.fromtimestamp(k[0]/1000))
+            o.append(float(k[1]))
+            h.append(float(k[2]))
+            l.append(float(k[3]))
+            c.append(float(k[4]))
+            v.append(float(k[5]))
+        return d,o,h,l,c,v
     except:
-        pass
-    return np.array(prices), dates, errors
+        return None
 
-# ---------------------------
-# ⏱️ HOURLY DATA
-# ---------------------------
-def get_hourly_data(symbol="BTCUSDT", hours=72):
-    fsym = symbol.replace("USDT","")
-    prices, dates = [], []
+def get_ohlc_cryptocompare(symbol, interval, limit):
     try:
-        url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={hours-1}"
+        fsym = symbol.replace("USDT","")
+        if interval == "15m":
+            url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={fsym}&tsym=USD&limit={limit}&aggregate=15"
+        elif interval == "1h":
+            url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={limit}"
+        else:
+            url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
         data = requests.get(url, timeout=5).json()
-        for x in data.get("Data", {}).get("Data", []):
-            prices.append(x["close"])
-            dates.append(datetime.fromtimestamp(x["time"]))
+        raw = data.get("Data", {}).get("Data", [])
+        d,o,h,l,c,v = [],[],[],[],[],[]
+        for x in raw:
+            d.append(datetime.fromtimestamp(x["time"]))
+            o.append(x["open"])
+            h.append(x["high"])
+            l.append(x["low"])
+            c.append(x["close"])
+            v.append(x.get("volumeto",0))
+        return d,o,h,l,c,v
     except:
-        pass
-    return np.array(prices), dates
+        return None
 
-# ---------------------------
+def get_ohlc_coingecko(symbol):
+    try:
+        coin = symbol.replace("USDT","").lower()
+        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=30"
+        data = requests.get(url, timeout=5).json()
+        prices = data.get("prices", [])
+        d,o,h,l,c,v = [],[],[],[],[],[]
+        for i in range(1,len(prices)):
+            t = datetime.fromtimestamp(prices[i][0]/1000)
+            prev = prices[i-1][1]
+            curr = prices[i][1]
+            d.append(t)
+            o.append(prev)
+            h.append(max(prev,curr))
+            l.append(min(prev,curr))
+            c.append(curr)
+            v.append(0)
+        return d,o,h,l,c,v
+    except:
+        return None
+
+def get_ohlc(symbol, timeframe):
+    mapping = {"15 Min": ("15m", 96),
+               "Hourly": ("1h", 48),
+               "Daily": ("1d", 30),
+               "3-Day": ("3d", 20),
+               "Weekly": ("1w", 12)}
+    interval, limit = mapping[timeframe]
+    for fn in [get_ohlc_binance, get_ohlc_cryptocompare, get_ohlc_coingecko]:
+        data = fn(symbol, interval, limit) if fn != get_ohlc_coingecko else fn(symbol)
+        if data: return data, fn.__name__
+    return None, "None"
+
+# =========================
 # 📈 INDICATORS
-# ---------------------------
+# =========================
 def calculate_rsi(prices, period=14):
     delta = np.diff(prices)
     gain = np.maximum(delta, 0)
@@ -109,8 +115,7 @@ def calculate_rsi(prices, period=14):
     avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
     avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
     rs = avg_gain/(avg_loss+1e-9)
-    rsi = 100 - (100/(1+rs))
-    return np.concatenate([[50], rsi])
+    return np.concatenate([[50], 100-(100/(1+rs))])
 
 def calculate_macd(prices):
     exp1 = pd.Series(prices).ewm(span=12,adjust=False).mean()
@@ -119,16 +124,16 @@ def calculate_macd(prices):
     signal = macd.ewm(span=9,adjust=False).mean()
     return macd.values, signal.values
 
-# ---------------------------
+# =========================
 # 📰 SENTIMENT
-# ---------------------------
+# =========================
 def get_sentiment():
     try:
         url = "https://min-api.cryptocompare.com/data/v2/news/?lang=EN"
         data = requests.get(url, timeout=5).json()
         scores=[]
         for a in data.get("Data", [])[:8]:
-            text = f"{a.get('title','')}"
+            text = a.get("title","")
             vader = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
             blob = TextBlob(text).sentiment.polarity
             scores.append((vader + blob)/2)
@@ -136,45 +141,27 @@ def get_sentiment():
     except:
         return 0
 
-# ---------------------------
+# =========================
 # 🔮 FORECAST
-# ---------------------------
+# =========================
 def arima_forecast(prices, steps):
     try:
-        model = ARIMA(prices, order=(2,1,2))
-        model_fit = model.fit()
-        return list(model_fit.forecast(steps=steps))
+        return list(ARIMA(prices, order=(2,1,2)).fit().forecast(steps=steps))
     except:
         return [prices[-1]]*steps
 
-def prophet_forecast(dates, prices, steps):
-    df = pd.DataFrame({"ds": pd.to_datetime(dates),"y":prices})
-    model=Prophet(daily_seasonality=True)
-    model.fit(df)
-    future=model.make_future_dataframe(periods=steps,freq="H")
-    f= model.predict(future)
-    return (f["yhat"].tail(steps).values,
-            f["yhat_upper"].tail(steps).values,
-            f["yhat_lower"].tail(steps).values)
-
-def hybrid_forecast(prices, dates, steps):
-    ar = arima_forecast(prices, steps)
-    pr, upper, lower = prophet_forecast(dates, prices, steps)
-    combined = [(a+p)/2 for a,p in zip(ar, pr)]
-    return combined, upper, lower
-
-# ---------------------------
+# =========================
 # 🧠 AI LOGIC
-# ---------------------------
+# =========================
 def load_weights():
-    ref=db.reference("weights")
-    data=ref.get() or {}
+    ref = db.reference("weights")
+    data = ref.get() or {}
     return data if data else {"rsi":1,"macd":1,"trend":1,"sentiment":1}
 
 def save_weights(weights):
     db.reference("weights").set(weights)
 
-def smart_signal(prices, rsi, macd, signal, sentiment, weights):
+def smart_signal(prices,rsi,macd,signal,sentiment,weights):
     score=0; contrib={}
     val=2*weights["rsi"] if rsi[-1]<30 else (-2*weights["rsi"] if rsi[-1]>70 else 0)
     score+=val; contrib["rsi"]=val
@@ -232,178 +219,79 @@ def calculate_confidence(upper, lower, price):
     return round(max(0,min(1,1-(upper-lower)/price))*100,2)
 
 # =========================
-# 🚀 BACKGROUND COLLECTOR
-# =========================
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
-
-for sym in COINS:
-    prices, dates, _ = get_historical_data(sym)
-    if len(prices) < 2:
-        continue
-
-    hr_prices, hr_dates = get_hourly_data(sym)
-    if len(hr_prices) > 0:
-        prices = np.concatenate([prices, hr_prices])
-        dates = dates + hr_dates
-
-    next_p, upper, lower = hybrid_forecast(prices, dates, 1)
-
-    rsi = calculate_rsi(prices)
-    macd_v, sig_line = calculate_macd(prices)
-    sentiment = get_sentiment()
-    weights = load_weights()
-
-    sig, score, con = smart_signal(prices, rsi, macd_v, sig_line, sentiment, weights)
-
-    save_prediction(sym, prices[-1], next_p[0], sig, con)
-
-    weights = update_weights(sym, weights)
-    save_weights(weights)
-
-# =========================
 # 🎨 UI
 # =========================
 st.title("🚀 AI Crypto Bot")
 
-# ---------------------------
-# 💰 Portfolio Inputs
-# ---------------------------
-portfolio={}
-buy={}
-with st.expander("💰 Portfolio"):
-    for c in COINS:
-        portfolio[c]=st.number_input(f"{c} amount",0.0,key=f"h{c}")
-        buy[c]=st.number_input(f"{c} buy price",0.0,key=f"b{c}")
-
-# ---------------------------
-# 🔹 Coin Selection
-# ---------------------------
-symbols=st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
-summary_data=[]
+timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day","Weekly"])
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
+symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
 for sym in symbols:
-    prices, dates, _ = get_historical_data(sym)
-    hr_prices, hr_dates = get_hourly_data(sym)
+    data, source = get_ohlc(sym, timeframe)
+    if data is None:
+        st.error(f"{sym} failed to fetch data from all sources")
+        continue
+    fd,o,h,l,c,v = data
+    next_p = arima_forecast(c,1)[0]
+    rsi = calculate_rsi(c)
+    macd_v, sig_line = calculate_macd(c)
+    sentiment = get_sentiment()
+    weights = load_weights()
+    sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
+    wr = calculate_win_rate(sym)
+    conf = calculate_confidence(max(c), min(c), c[-1])
 
-    if len(hr_prices)>0:
-        prices=np.concatenate([prices,hr_prices])
-        dates=dates+hr_dates
+    # Two-column layout
+    col_chart, col_stats = st.columns([3,1])
 
-    combined = sorted(zip(dates, prices), key=lambda x: x[0])
-    fd=[x[0] for x in combined]
-    fp=[x[1] for x in combined]
-    if len(fp)<2: continue
-
-    # ---------------------------
-    # Forecast
-    # ---------------------------
-    next_p, upper, lower = hybrid_forecast(fp, fd, 1)
-    rsi=calculate_rsi(fp)
-    macd_v, sig_line=calculate_macd(fp)
-    sentiment=get_sentiment()
-    weights=load_weights()
-    sig,score,con=smart_signal(fp,rsi,macd_v,sig_line,sentiment,weights)
-    save_prediction(sym,fp[-1],next_p[0],sig,con)
-    weights=update_weights(sym,weights)
-    save_weights(weights)
-    wr=calculate_win_rate(sym)
-    conf=calculate_confidence(upper[0],lower[0],fp[-1])
-    summary_data.append({
-        "Coin":sym,
-        "Price":fp[-1],
-        "Signal":sig,
-        "Score":score,
-        "WinRate":wr,
-        "Confidence":conf
-    })
-
-# ---------------------------
-# 📊 Summary Table
-# ---------------------------
-st.subheader("📊 Summary")
-st.dataframe(pd.DataFrame(summary_data))
-
-# ---------------------------
-# 📈 Charts + Stats
-# ---------------------------
-for sym in symbols:
-    prices, dates, _ = get_historical_data(sym)
-    hr_prices, hr_dates = get_hourly_data(sym)
-    if len(hr_prices)>0:
-        prices=np.concatenate([prices, hr_prices])
-        dates=dates+hr_dates
-    combined = sorted(zip(dates, prices), key=lambda x: x[0])
-    fd=[x[0] for x in combined]
-    fp=[x[1] for x in combined]
-    if len(fp)<2: continue
-
-    # Forecast until end of day (curved yellow line)
-    last_time = fd[-1]
-    end_of_day = datetime.combine(datetime.utcnow().date(), datetime.min.time()) + timedelta(days=1)
-    forecast_hours = max(1, int((end_of_day - last_time).total_seconds() // 3600))
-    forecast_series = arima_forecast(fp, forecast_hours)
-    forecast_times = pd.date_range(start=last_time + timedelta(hours=1), periods=forecast_hours, freq="H")
-
-    # ---------------------------
-    # Chart
-    # ---------------------------
-    st.markdown(f"### {sym} — Current Price: ${round(fp[-1],2)}")
-    col1, col2 = st.columns([3,1])
-
-    fig = go.Figure()
-    # Historical prices line (blue dash)
-    fig.add_trace(go.Scatter(x=fd, y=fp, name=sym, line=dict(color="blue", dash="dash")))
-    # Forecast yellow curve
-    fig.add_trace(go.Scatter(
-        x=[last_time]+list(forecast_times),
-        y=[fp[-1]]+list(forecast_series),
-        mode="lines",
-        line=dict(color="yellow", width=3, dash="dash"),
-        name="Forecast"
-    ))
-
-    # Candlestick overlay (green/red) for last N points
-    if len(fp)>=10:
-        fig.add_trace(go.Candlestick(
-            x=fd[-10:],
-            open=fp[-10:],
-            high=[p*1.01 for p in fp[-10:]],
-            low=[p*0.99 for p in fp[-10:]],
-            close=fp[-10:],
-            name="Candlestick",
-            increasing_line_color='green',
-            decreasing_line_color='red'
-        ))
-
-    # Chart layout
-    fig.update_layout(
-        xaxis_title="Time",
-        yaxis_title="Price (USD)",
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_rangeslider_visible=False
-    )
-
-    with col1:
-        st.plotly_chart(fig, use_container_width=True)
-
-    # ---------------------------
-    # Right Stats Panel
-    # ---------------------------
-    color={"BUY":"green","SELL":"red","HOLD":"#777777"}
-    with col2:
-        st.markdown(
-            f"<div style='padding:8px;border-radius:8px;background:{color[sig]};color:white;text-align:center;font-weight:bold'>{sig}</div>",
-            unsafe_allow_html=True
+    # --- Chart ---
+    with col_chart:
+        color = "green" if next_p>c[-1] else "red"
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
+                                     increasing_line_color='green',
+                                     decreasing_line_color='red',
+                                     name="Price"))
+        fig.add_trace(go.Scatter(x=[fd[-1],fd[-1]+timedelta(hours=1)],
+                                 y=[c[-1],next_p],
+                                 mode="lines", line=dict(color=color, width=3),
+                                 name="Forecast"))
+        fig.update_layout(
+            dragmode=False,
+            margin=dict(l=20,r=20,t=30,b=20),
+            updatemenus=[dict(type="buttons", y=1, x=1.05, showactive=False, buttons=[
+                dict(label="+", method="relayout", args=["xaxis.range[1]", fd[-1]]),
+                dict(label="-", method="relayout", args=["xaxis.range[0]", fd[0]])
+            ])]
         )
-        st.markdown(f"**Score:** {score} _(AI contribution)_")
-        st.markdown(f"**WinRate:** {wr}% _(Accuracy of past signals)_")
-        st.markdown(f"**Confidence:** {conf}% _(Forecast confidence)_")
-        st.markdown(f"**RSI:** {rsi[-1]:.2f} _(Relative Strength Index)_")
-        st.markdown(f"**MACD:** {macd_v[-1]-sig_line[-1]:.4f} _(MACD difference)_")
-        st.markdown(f"**Sentiment:** {sentiment:.2f} _(Market news sentiment)_")
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.caption(f"Source: {source}")
 
-# ---------------------------
-# Debug Panel
-# ---------------------------
-with st.expander("🛠️ Debug Panel"):
-    st.write("Historical data, forecast points, and any errors can be logged here.")
+    # --- Stats Panel ---
+    tooltip = {
+        "Signal":"AI trading signal: BUY, SELL, or HOLD based on indicators",
+        "Score":"Aggregated score from RSI, MACD, Trend, Sentiment",
+        "WinRate":"Historical accuracy percentage of previous signals",
+        "Confidence":"Forecast reliability percentage based on upper/lower bounds",
+        "RSI":"Relative Strength Index (<30 oversold, >70 overbought)",
+        "MACD":"MACD vs Signal line; trend momentum indicator",
+        "Sentiment":"Average sentiment score from recent news"
+    }
+
+    with col_stats:
+        st.markdown(f"### {sym} Stats")
+        st.markdown(f"<span title='{tooltip['Signal']}'>**Signal:**</span> {sig}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {wr}%", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
+        st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
+
+# =========================
+# 🧰 DEBUG PANEL
+# =========================
+with st.expander("🧰 Debug Panel"):
+    st.write("Selected Timeframe:", timeframe)
+    st.write("Session State:", st.session_state)
