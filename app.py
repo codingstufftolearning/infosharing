@@ -13,7 +13,7 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 # =========================
-# 🔄 AUTO REFRESH
+# 🔄 AUTO REFRESH (30 MIN)
 # =========================
 st_autorefresh(interval=1800000, key="refresh")
 
@@ -32,17 +32,13 @@ if not firebase_admin._apps:
         st.error(f"Firebase Initialization Error: {e}")
 
 # =========================
-# 📡 MULTI SOURCE OHLC
+# 📊 DATA FETCH FUNCTIONS
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         data = requests.get(url, params=params, timeout=5).json()
-
-        if not isinstance(data, list):
-            return None
-
         d,o,h,l,c,v = [],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]/1000))
@@ -64,12 +60,8 @@ def get_ohlc_cryptocompare(symbol, interval, limit):
             url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={limit}"
         else:
             url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
-
         data = requests.get(url, timeout=5).json()
         raw = data.get("Data", {}).get("Data", [])
-        if not raw:
-            return None
-
         d,o,h,l,c,v = [],[],[],[],[],[]
         for x in raw:
             d.append(datetime.fromtimestamp(x["time"]))
@@ -88,16 +80,11 @@ def get_ohlc_coingecko(symbol):
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=30"
         data = requests.get(url, timeout=5).json()
         prices = data.get("prices", [])
-
-        if not prices:
-            return None
-
         d,o,h,l,c,v = [],[],[],[],[],[]
         for i in range(1,len(prices)):
             t = datetime.fromtimestamp(prices[i][0]/1000)
             prev = prices[i-1][1]
             curr = prices[i][1]
-
             d.append(t)
             o.append(prev)
             h.append(max(prev,curr))
@@ -109,25 +96,19 @@ def get_ohlc_coingecko(symbol):
         return None
 
 def get_ohlc(symbol, timeframe):
-    mapping = {
-        "15 Min": ("15m", 96),
-        "Hourly": ("1h", 48),
-        "Daily": ("1d", 30),
-        "3-Day": ("3d", 20),
-        "Weekly": ("1w", 12)
-    }
-
+    mapping = {"15 Min": ("15m", 96),
+               "Hourly": ("1h", 48),
+               "Daily": ("1d", 30),
+               "3-Day": ("3d", 20),
+               "Weekly": ("1w", 12)}
     interval, limit = mapping[timeframe]
-
     for fn in [get_ohlc_binance, get_ohlc_cryptocompare, get_ohlc_coingecko]:
         data = fn(symbol, interval, limit) if fn != get_ohlc_coingecko else fn(symbol)
-        if data:
-            return data, fn.__name__
-
+        if data: return data, fn.__name__
     return None, "None"
 
 # =========================
-# 📊 INDICATORS (UNCHANGED)
+# 📈 INDICATORS
 # =========================
 def calculate_rsi(prices, period=14):
     delta = np.diff(prices)
@@ -146,7 +127,7 @@ def calculate_macd(prices):
     return macd.values, signal.values
 
 # =========================
-# 📰 SENTIMENT (UNCHANGED)
+# 📰 SENTIMENT
 # =========================
 def get_sentiment():
     try:
@@ -154,108 +135,154 @@ def get_sentiment():
         data = requests.get(url, timeout=5).json()
         scores=[]
         for a in data.get("Data", [])[:8]:
-            text=a.get("title","")
-            vader=SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
-            blob=TextBlob(text).sentiment.polarity
-            scores.append((vader+blob)/2)
+            text = a.get("title","")
+            vader = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
+            blob = TextBlob(text).sentiment.polarity
+            scores.append((vader + blob)/2)
         return np.mean(scores) if scores else 0
     except:
         return 0
 
 # =========================
-# 🔮 FORECAST (UNCHANGED)
+# 🔮 FORECAST
 # =========================
 def arima_forecast(prices, steps):
     try:
-        model = ARIMA(prices, order=(2,1,2))
-        return list(model.fit().forecast(steps=steps))
+        return list(ARIMA(prices, order=(2,1,2)).fit().forecast(steps=steps))
     except:
         return [prices[-1]]*steps
 
 # =========================
-# 🚀 BACKGROUND COLLECTOR (UNCHANGED)
+# 🧠 AI LOGIC
 # =========================
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
+def load_weights():
+    ref = db.reference("weights")
+    data = ref.get() or {}
+    return data if data else {"rsi":1,"macd":1,"trend":1,"sentiment":1}
+
+def save_weights(weights):
+    db.reference("weights").set(weights)
+
+def smart_signal(prices,rsi,macd,signal,sentiment,weights):
+    score=0; contrib={}
+    val=2*weights["rsi"] if rsi[-1]<30 else (-2*weights["rsi"] if rsi[-1]>70 else 0)
+    score+=val; contrib["rsi"]=val
+    val=(1 if macd[-1]>signal[-1] else -1)*weights["macd"]
+    score+=val; contrib["macd"]=val
+    val=(1 if prices[-1]>np.mean(prices) else -1)*weights["trend"]
+    score+=val; contrib["trend"]=val
+    val=2*weights["sentiment"] if sentiment>0.2 else (-2*weights["sentiment"] if sentiment<-0.2 else 0)
+    score+=val; contrib["sentiment"]=val
+    if score>=3: return "BUY",score,contrib
+    elif score<=-3: return "SELL",score,contrib
+    return "HOLD",score,contrib
+
+def update_weights(symbol, weights):
+    ref=db.reference(f"history/{symbol}")
+    data=list((ref.get() or {}).values())
+    if len(data)<2: return weights
+    prev,curr=data[-2],data[-1]
+    actual_up = curr["price"]>prev["price"]
+    lr=0.03
+    for key in weights:
+        contrib=prev.get("contributions",{}).get(key,0)
+        if contrib==0: continue
+        if (contrib>0 and actual_up) or (contrib<0 and not actual_up):
+            weights[key]*=(1+lr)
+        else:
+            weights[key]*=(1-lr)
+        weights[key]=max(0.2,min(weights[key],3))
+    return weights
+
+def save_prediction(symbol, price, pred, sig, contrib):
+    ref=db.reference(f"history/{symbol}")
+    ref.push({
+        "time":datetime.utcnow().isoformat(),
+        "price":float(price),
+        "predicted":float(pred),
+        "signal":sig,
+        "contributions":contrib
+    })
+
+def calculate_win_rate(symbol):
+    ref=db.reference(f"history/{symbol}")
+    data=list((ref.get() or {}).values())
+    wins,total=0,0
+    for i in range(len(data)-1):
+        curr,nxt=data[i],data[i+1]
+        sig=curr.get("signal","HOLD")
+        cp=curr.get("price",0); np_=nxt.get("price",0)
+        if sig=="BUY" and np_>cp: wins+=1
+        elif sig=="SELL" and np_<cp: wins+=1
+        total+=1
+    return round((wins/total)*100,2) if total>0 else 0
+
+def calculate_confidence(upper, lower, price):
+    return round(max(0,min(1,1-(upper-lower)/price))*100,2)
 
 # =========================
 # 🎨 UI
 # =========================
 st.title("🚀 AI Crypto Bot")
 
-timeframe = st.selectbox("Timeframe", ["15 Min","Hourly","Daily","3-Day","Weekly"])
-
+timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day","Weekly"])
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
 # =========================
-# 📈 DETAILS (FULLY UPGRADED)
+# MAIN DISPLAY LOOP
 # =========================
 for sym in symbols:
-
     data, source = get_ohlc(sym, timeframe)
     if data is None:
-        st.error(f"{sym} failed all sources")
+        st.error(f"{sym} failed to fetch data from all sources")
         continue
-
     fd,o,h,l,c,v = data
 
-    # ZOOM SYSTEM
-    if f"zoom_{sym}" not in st.session_state:
-        st.session_state[f"zoom_{sym}"] = len(fd)
+    next_p = arima_forecast(c,1)[0]
+    rsi = calculate_rsi(c)
+    macd_v, sig_line = calculate_macd(c)
+    sentiment = get_sentiment()
+    weights = load_weights()
+    sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
+    wr = calculate_win_rate(sym)
+    conf = calculate_confidence(max(c), min(c), c[-1])  # simplified confidence
 
-    colz1,colz2 = st.columns(2)
+    # Two-column layout
+    col_chart, col_stats = st.columns([3,1])
 
-    with colz1:
-        if st.button(f"Zoom In {sym}"):
-            st.session_state[f"zoom_{sym}"] -= 5
+    with col_chart:
+        color = "green" if next_p>c[-1] else "red"
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=fd, y=c, mode="lines", name="Price", line=dict(color="gray", dash="dash")))
+        fig.add_trace(go.Scatter(x=[fd[-1],fd[-1]+timedelta(hours=1)], y=[c[-1],next_p], mode="lines", name="Forecast", line=dict(color=color, width=3)))
+        fig.update_layout(
+            dragmode=False,
+            xaxis=dict(fixedrange=True),
+            yaxis=dict(fixedrange=True),
+            margin=dict(l=20,r=20,t=30,b=20),
+            showlegend=False,
+            updatemenus=[dict(type="buttons", y=1, x=1.05, showactive=False, buttons=[
+                dict(label="+", method="relayout", args=["xaxis.range[1]", fd[-1]]),
+                dict(label="-", method="relayout", args=["xaxis.range[0]", fd[0]])
+            ])]
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.caption(f"Source: {source}")
 
-    with colz2:
-        if st.button(f"Zoom Out {sym}"):
-            st.session_state[f"zoom_{sym}"] += 5
-
-    zoom = st.slider(f"Zoom {sym}", 10, len(fd), st.session_state[f"zoom_{sym}"])
-
-    fd = fd[-zoom:]
-    o = o[-zoom:]
-    h = h[-zoom:]
-    l = l[-zoom:]
-    c = c[-zoom:]
-    v = v[-zoom:]
-
-    pred = arima_forecast(c, 1)[0]
-
-    fig = go.Figure()
-
-    fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c))
-    fig.add_trace(go.Bar(x=fd, y=v, yaxis="y2"))
-
-    fig.add_trace(go.Scatter(
-        x=fd, y=c,
-        line=dict(dash="dash", color="gray")
-    ))
-
-    color = "green" if pred > c[-1] else "red"
-
-    fig.add_trace(go.Scatter(
-        x=[fd[-1], fd[-1]+timedelta(hours=1)],
-        y=[c[-1], pred],
-        line=dict(color=color, width=3)
-    ))
-
-    fig.update_layout(
-        dragmode=False,
-        xaxis=dict(fixedrange=True),
-        yaxis=dict(fixedrange=True),
-        yaxis2=dict(overlaying="y", side="right"),
-        showlegend=False
-    )
-
-    st.subheader(sym)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    st.caption(f"Source: {source}")
+    with col_stats:
+        st.markdown(f"### {sym} Stats")
+        st.markdown(f"**Signal:** {sig}")
+        st.markdown(f"**Score:** {score}")
+        st.markdown(f"**WinRate:** {wr}%")
+        st.markdown(f"**Confidence:** {conf}%")
+        st.markdown(f"**RSI:** {round(rsi[-1],2)}")
+        st.markdown(f"**MACD:** {round(macd_v[-1],2)} / {round(sig_line[-1],2)}")
+        st.markdown(f"**Sentiment:** {round(sentiment,2)}")
 
 # =========================
 # 🧰 DEBUG PANEL
 # =========================
 with st.expander("🧰 Debug Panel"):
-    st.write("Timeframe:", timeframe)
+    st.write("Selected Timeframe:", timeframe)
     st.write("Session State:", st.session_state)
