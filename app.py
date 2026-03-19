@@ -11,6 +11,7 @@ from statsmodels.tsa.arima.model import ARIMA
 from prophet import Prophet
 import firebase_admin
 from firebase_admin import credentials, db
+import warnings
 
 # =========================
 # 🔄 AUTO REFRESH (30 MIN)
@@ -75,7 +76,7 @@ def get_ohlc_cryptocompare(symbol, interval, limit):
 def get_ohlc_coingecko(symbol):
     try:
         coin = symbol.replace("USDT","").lower()
-        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=60"
+        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=365"
         data = requests.get(url, timeout=5).json()
         prices = data.get("prices", [])
         d,o,h,l,c,v = [],[],[],[],[],[]
@@ -97,8 +98,8 @@ def get_ohlc(symbol, timeframe):
     mapping = {
         "15 Min": ("15m", 96),
         "Hourly": ("1h", 48),
-        "Daily": ("1d", 100),
-        "3-Day": ("3d", 60)
+        "Daily": ("1d", 180),
+        "3-Day": ("3d", 90)
     }
     interval, limit = mapping[timeframe]
     for fn in [get_ohlc_binance, get_ohlc_cryptocompare, get_ohlc_coingecko]:
@@ -111,19 +112,19 @@ def get_ohlc(symbol, timeframe):
 # =========================
 def calculate_rsi(prices, period=14):
     prices = np.array(prices)
-    if len(prices) < period+1:
+    if len(prices)<period+1:
         return np.array([50]*len(prices))
     delta = np.diff(prices)
     gain = np.maximum(delta,0)
     loss = np.abs(np.minimum(delta,0))
     avg_gain = pd.Series(gain).rolling(period,min_periods=1).mean()
     avg_loss = pd.Series(loss).rolling(period,min_periods=1).mean()
-    rs = avg_gain / (avg_loss + 1e-9)
-    return np.concatenate([[50], 100-(100/(1+rs))])
+    rs = avg_gain/(avg_loss+1e-9)
+    return np.concatenate([[50],100-(100/(1+rs))])
 
 def calculate_macd(prices):
     prices = np.array(prices)
-    if len(prices) < 26:
+    if len(prices)<26:
         return np.zeros(len(prices)), np.zeros(len(prices))
     exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
     exp2 = pd.Series(prices).ewm(span=26, adjust=False).mean()
@@ -160,7 +161,11 @@ def arima_forecast(prices, steps):
 def prophet_forecast(fd, c, step_delta):
     df = pd.DataFrame({"ds": fd, "y": c})
     m = Prophet(daily_seasonality=True, weekly_seasonality=False, yearly_seasonality=False)
-    m.fit(df)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        m.fit(df)
+    # Collect warnings
+    prophet_warnings = [str(warn.message) for warn in w]
     last_date = fd[-1]
     end_of_day = datetime.combine(last_date.date(), time(23,59))
     future_dates = []
@@ -169,10 +174,10 @@ def prophet_forecast(fd, c, step_delta):
         future_dates.append(curr)
         curr += step_delta
     if not future_dates:
-        return [], []
+        return [], [], prophet_warnings
     future_df = pd.DataFrame({"ds": future_dates})
     forecast = m.predict(future_df)
-    return np.array(future_dates), np.array(forecast["yhat"].values)
+    return np.array(future_dates), np.array(forecast["yhat"].values), prophet_warnings
 
 # =========================
 # 🧠 AI LOGIC
@@ -238,12 +243,14 @@ st.title("🚀 AI Crypto Bot")
 st.sidebar.header("💰 Portfolio Tracker")
 COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
 portfolio = {}
+total_pl = 0
 for sym in COINS:
     col1, col2 = st.sidebar.columns(2)
     amount = col1.number_input(f"{sym} Amount", min_value=0.0, step=0.01, key=f"{sym}_amt")
     buy_price = col2.number_input(f"{sym} Buy Price", min_value=0.0, step=0.01, key=f"{sym}_buy")
     if amount>0 and buy_price>0:
-        portfolio[sym] = {"amount": amount, "buy_price": buy_price}
+        pl = (0-buy_price)*amount  # placeholder last price=0, updated later
+        portfolio[sym] = {"amount": amount, "buy_price": buy_price, "pl": pl}
 
 timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day"])
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
@@ -267,7 +274,11 @@ step_mapping = {
 forecast_step = step_mapping[timeframe]
 
 debug_info=[]
+total_portfolio_pl = 0
 
+# =========================
+# Process Coins
+# =========================
 for sym in symbols:
     try:
         data, source = get_ohlc(sym, timeframe)
@@ -284,45 +295,67 @@ for sym in symbols:
         macd_v, sig_line = calculate_macd(c)
         sentiment = get_sentiment()
         weights = load_weights()
-        sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
-        wr = 0  # optional historical winrate
-        conf = round(max(0,min(1,1-(max(c)-min(c))/c[-1]))*100,2)
+        sig,score,contrib = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
+
+        # WinRate
+        ref=db.reference(f"history/{sym}")
+        hist=list((ref.get() or {}).values())
+        wins,total=0,0
+        for i in range(len(hist)-1):
+            curr, nxt = hist[i], hist[i+1]
+            cp, np_ = curr.get("price",0), nxt.get("price",0)
+            s = curr.get("signal","HOLD")
+            if s=="BUY" and np_>cp: wins+=1
+            elif s=="SELL" and np_<cp: wins+=1
+            total+=1
+        winrate = round((wins/total)*100,2) if total>0 else 0
 
         # Forecast
         future_dates_arima=[]
-        curr = fd[-1] + forecast_step
-        while curr <= datetime.combine(fd[-1].date(), time(23,59)):
-            future_dates_arima.append(curr)
-            curr+=forecast_step
+        curr_fd = fd[-1]+forecast_step
+        while curr_fd <= datetime.combine(fd[-1].date(), time(23,59)):
+            future_dates_arima.append(curr_fd)
+            curr_fd += forecast_step
+
         future_prices_arima = arima_forecast(c, len(future_dates_arima))
+        future_dates_prophet, future_prices_prophet, prophet_warns = prophet_forecast(fd, c, forecast_step)
+        debug_info.extend([f"{sym} Prophet Warning: {w}" for w in prophet_warns])
 
-        future_dates_prophet, future_prices_prophet = prophet_forecast(fd, c, forecast_step)
-        if len(future_dates_prophet)==0:
-            future_dates_prophet = np.array(future_dates_arima)
-            future_prices_prophet = np.array(future_prices_arima)
+        # Safe fallback
+        if len(future_prices_arima)==0: future_prices_arima = np.array([c[-1]]*len(future_dates_arima))
+        else: future_prices_arima = np.array(future_prices_arima)
+        if len(future_prices_prophet)==0: future_prices_prophet = np.array([c[-1]]*len(future_dates_arima))
+        else: future_prices_prophet = np.array(future_prices_prophet)
 
-        # NumPy arrays
-        future_prices_arima = np.array(future_prices_arima)
-        future_prices_prophet = np.array(future_prices_prophet)
-        future_prices = (future_prices_arima + future_prices_prophet)/2
-
-        # ================================
-        # 🔹 Smooth Forecast
-        alpha = 0.3
-        smoothed_forecast = [future_prices[0]]
-        for i in range(1, len(future_prices)):
-            smoothed_forecast.append(alpha*future_prices[i] + (1-alpha)*smoothed_forecast[-1])
-        future_prices = np.array(smoothed_forecast)
-        # ================================
-
+        # Combine & smooth
+        future_prices = (future_prices_arima+future_prices_prophet)/2
+        if len(future_prices)>0:
+            alpha=0.3
+            smooth_forecast=[future_prices[0]]
+            for i in range(1,len(future_prices)):
+                smooth_forecast.append(alpha*future_prices[i]+(1-alpha)*smooth_forecast[-1])
+            future_prices = np.array(smooth_forecast)
+        else:
+            future_prices = np.array([c[-1]]*len(future_dates_arima))
         future_dates = np.array(future_dates_arima)
 
-        # Coin Box
+        # =========================
+        # Coin Container with white line border
+        # =========================
         with st.container():
             st.markdown(f"<div style='border:1px solid white; padding:10px; border-radius:8px; margin-bottom:10px;'>", unsafe_allow_html=True)
             st.markdown(f"### {sym}")
 
             col_chart, col_stats = st.columns([3,1])
+
+            # Mini Sparkline
+            with col_chart:
+                spark_fig = go.Figure()
+                spark_fig.add_trace(go.Scatter(x=fd, y=c, mode="lines", line=dict(color="cyan", width=2)))
+                spark_fig.update_layout(height=80, margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(showticklabels=False), yaxis=dict(showticklabels=False))
+                st.plotly_chart(spark_fig, use_container_width=True, config={"displayModeBar":False})
+
+            # Main Candlestick + Forecast + signal markers
             with col_chart:
                 fig=go.Figure()
                 fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
@@ -334,6 +367,13 @@ for sym in symbols:
                     marker=dict(size=6, symbol="circle"),
                     name="Forecast"
                 ))
+                # Signal history markers
+                for h in hist:
+                    if "signal" in h:
+                        color="green" if h["signal"]=="BUY" else ("red" if h["signal"]=="SELL" else "blue")
+                        fig.add_trace(go.Scatter(x=[datetime.fromisoformat(h["time"])], y=[h["price"]], mode="markers",
+                                                 marker=dict(color=color, size=8, symbol="triangle-up" if color=="green" else "triangle-down" if color=="red" else "circle"),
+                                                 name=h["signal"]))
                 fig.update_layout(dragmode=False, margin=dict(l=20,r=20,t=30,b=20))
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False})
                 st.caption(f"Source: {source}")
@@ -341,29 +381,36 @@ for sym in symbols:
             with col_stats:
                 st.markdown(f"<span title='{tooltip['Signal']}'>**Signal:**</span> {sig}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
-                st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
+                st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {winrate}%", unsafe_allow_html=True)
+                if len(c)>0:
+                    conf = round(max(0,min(1,1-(max(c)-min(c))/c[-1]))*100,2)
+                    st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
 
-                if sym in portfolio:
-                    info = portfolio[sym]
-                    pl = (c[-1]-info["buy_price"])*info["amount"]
-                    color = "green" if pl>=0 else "red"
-                    st.markdown(f"<span>**Portfolio P/L:**</span> <span style='color:{color}'>${pl:.2f}</span>", unsafe_allow_html=True)
-
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # Save for dynamic learning
-        save_prediction(sym, c[-1], future_prices[-1], sig, con)
-        weights = update_weights(sym, weights)
-        debug_info.append(f"{sym}: min={min(c)}, max={max(c)}, last={c[-1]}")
+        # =========================
+        # Update Portfolio P/L
+        # =========================
+        if sym in portfolio:
+            amount = portfolio[sym]["amount"]
+            buy_price = portfolio[sym]["buy_price"]
+            last_price = c[-1]
+            portfolio[sym]["pl"] = (last_price - buy_price)*amount
+            total_portfolio_pl += portfolio[sym]["pl"]
 
     except Exception as e:
-        debug_info.append(f"{sym}: Exception occurred - {e}")
+        debug_info.append(f"{sym}: Exception occurred - {str(e)}")
 
 # =========================
-# 🧰 Debug Panel at bottom
+# Portfolio Summary
+# =========================
+st.sidebar.markdown(f"### Total Portfolio P/L: ${round(total_portfolio_pl,2)}")
+
+# =========================
+# 🧰 Debug Panel
 # =========================
 with st.expander("🧰 Debug Panel"):
     for line in debug_info:
