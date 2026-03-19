@@ -249,8 +249,7 @@ for sym in COINS:
     amount = col1.number_input(f"{sym} Amount", min_value=0.0, step=0.01, key=f"{sym}_amt")
     buy_price = col2.number_input(f"{sym} Buy Price", min_value=0.0, step=0.01, key=f"{sym}_buy")
     if amount>0 and buy_price>0:
-        pl = (0-buy_price)*amount  # placeholder last price=0, updated later
-        portfolio[sym] = {"amount": amount, "buy_price": buy_price, "pl": pl}
+        portfolio[sym] = {"amount": amount, "buy_price": buy_price, "pl": 0}
 
 timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day"])
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
@@ -367,13 +366,18 @@ for sym in symbols:
                     marker=dict(size=6, symbol="circle"),
                     name="Forecast"
                 ))
-                # Signal history markers
+                # Signal history markers (only BUY/SELL)
                 for h in hist:
-                    if "signal" in h:
-                        color="green" if h["signal"]=="BUY" else ("red" if h["signal"]=="SELL" else "blue")
-                        fig.add_trace(go.Scatter(x=[datetime.fromisoformat(h["time"])], y=[h["price"]], mode="markers",
-                                                 marker=dict(color=color, size=8, symbol="triangle-up" if color=="green" else "triangle-down" if color=="red" else "circle"),
-                                                 name=h["signal"]))
+                    if "signal" in h and h["signal"] in ["BUY","SELL"]:
+                        color = "green" if h["signal"]=="BUY" else "red"
+                        fig.add_trace(go.Scatter(
+                            x=[datetime.fromisoformat(h["time"])],
+                            y=[h["price"]],
+                            mode="markers",
+                            marker=dict(color=color, size=8, symbol="triangle-up" if color=="green" else "triangle-down"),
+                            name=h["signal"]
+                        ))
+
                 fig.update_layout(dragmode=False, margin=dict(l=20,r=20,t=30,b=20))
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False})
                 st.caption(f"Source: {source}")
@@ -383,7 +387,7 @@ for sym in symbols:
                 st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {winrate}%", unsafe_allow_html=True)
                 if len(c)>0:
-                    conf = round(max(0,min(1,1-(max(c)-min(c))/c[-1]))*100,2)
+                    conf = round(max(0,min(1,1-(max(c)-min(c))/c[-1])*100),2)
                     st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
                 st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
@@ -392,13 +396,13 @@ for sym in symbols:
             st.markdown("</div>", unsafe_allow_html=True)
 
         # =========================
-        # Update Portfolio P/L
+        # Update Portfolio
         # =========================
         if sym in portfolio:
-            amount = portfolio[sym]["amount"]
+            amt = portfolio[sym]["amount"]
             buy_price = portfolio[sym]["buy_price"]
             last_price = c[-1]
-            portfolio[sym]["pl"] = (last_price - buy_price)*amount
+            portfolio[sym]["pl"] = (last_price-buy_price)*amt
             total_portfolio_pl += portfolio[sym]["pl"]
 
     except Exception as e:
