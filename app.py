@@ -75,7 +75,7 @@ def get_ohlc_cryptocompare(symbol, interval, limit):
 def get_ohlc_coingecko(symbol):
     try:
         coin = symbol.replace("USDT","").lower()
-        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=30"
+        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=60"
         data = requests.get(url, timeout=5).json()
         prices = data.get("prices", [])
         d,o,h,l,c,v = [],[],[],[],[],[]
@@ -94,11 +94,12 @@ def get_ohlc_coingecko(symbol):
         return None
 
 def get_ohlc(symbol, timeframe):
-    mapping = {"15 Min": ("15m", 96),
-               "Hourly": ("1h", 48),
-               "Daily": ("1d", 30),
-               "3-Day": ("3d", 20),
-               "Weekly": ("1w", 12)}
+    mapping = {
+        "15 Min": ("15m", 96),
+        "Hourly": ("1h", 48),
+        "Daily": ("1d", 100),   # increased limit for enough data
+        "3-Day": ("3d", 60)
+    }
     interval, limit = mapping[timeframe]
     for fn in [get_ohlc_binance, get_ohlc_cryptocompare, get_ohlc_coingecko]:
         data = fn(symbol, interval, limit) if fn != get_ohlc_coingecko else fn(symbol)
@@ -229,7 +230,7 @@ for sym in COINS:
     if amount>0 and buy_price>0:
         portfolio[sym] = {"amount": amount, "buy_price": buy_price}
 
-timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day","Weekly"])
+timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day"])
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
 tooltip = {
@@ -247,8 +248,7 @@ step_mapping = {
     "15 Min": timedelta(minutes=15),
     "Hourly": timedelta(hours=1),
     "Daily": timedelta(days=1),
-    "3-Day": timedelta(days=3),
-    "Weekly": timedelta(weeks=1)
+    "3-Day": timedelta(days=3)
 }
 forecast_step = step_mapping[timeframe]
 
