@@ -227,13 +227,24 @@ timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day",
 COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
+# =========================
+# 💰 PORTFOLIO INPUT
+# =========================
+portfolio = {}
+buy_price = {}
+with st.expander("💰 Portfolio"):
+    for c in COINS:
+        portfolio[c] = st.number_input(f"{c} amount", 0.0, key=f"amt_{c}")
+        buy_price[c] = st.number_input(f"{c} buy price", 0.0, key=f"buy_{c}")
+
 for sym in symbols:
     data, source = get_ohlc(sym, timeframe)
     if data is None:
         st.error(f"{sym} failed to fetch data from all sources")
         continue
     fd,o,h,l,c,v = data
-    next_p = arima_forecast(c,1)[0]
+    # Forecast to end of day
+    next_p = arima_forecast(c, 1)[0]
     rsi = calculate_rsi(c)
     macd_v, sig_line = calculate_macd(c)
     sentiment = get_sentiment()
@@ -242,20 +253,22 @@ for sym in symbols:
     wr = calculate_win_rate(sym)
     conf = calculate_confidence(max(c), min(c), c[-1])
 
-    # Two-column layout
     col_chart, col_stats = st.columns([3,1])
 
     # --- Chart ---
     with col_chart:
-        color = "green" if next_p>c[-1] else "red"
         fig = go.Figure()
         fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
                                      increasing_line_color='green',
                                      decreasing_line_color='red',
                                      name="Price"))
-        fig.add_trace(go.Scatter(x=[fd[-1],fd[-1]+timedelta(hours=1)],
+        # Forecast yellow dash line to end of day
+        last_time = fd[-1]
+        end_of_day = last_time.replace(hour=23, minute=59)
+        fig.add_trace(go.Scatter(x=[last_time,end_of_day],
                                  y=[c[-1],next_p],
-                                 mode="lines", line=dict(color=color, width=3),
+                                 mode="lines",
+                                 line=dict(color="yellow", width=3, dash="dash"),
                                  name="Forecast"))
         fig.update_layout(
             dragmode=False,
@@ -288,6 +301,13 @@ for sym in symbols:
         st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
         st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
         st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
+
+        # Portfolio P/L
+        if sym in portfolio and sym in buy_price:
+            amt = portfolio[sym]
+            bp = buy_price[sym]
+            pnl = amt * (c[-1] - bp)
+            st.markdown(f"<span title='Profit / Loss based on your amount and buy price'>**P/L:**</span> ${round(pnl,2)}", unsafe_allow_html=True)
 
 # =========================
 # 🧰 DEBUG PANEL
