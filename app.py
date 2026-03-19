@@ -158,9 +158,6 @@ def load_weights():
     data = ref.get() or {}
     return data if data else {"rsi":1,"macd":1,"trend":1,"sentiment":1}
 
-def save_weights(weights):
-    db.reference("weights").set(weights)
-
 def smart_signal(prices,rsi,macd,signal,sentiment,weights):
     score=0; contrib={}
     val=2*weights["rsi"] if rsi[-1]<30 else (-2*weights["rsi"] if rsi[-1]>70 else 0)
@@ -174,33 +171,6 @@ def smart_signal(prices,rsi,macd,signal,sentiment,weights):
     if score>=3: return "BUY",score,contrib
     elif score<=-3: return "SELL",score,contrib
     return "HOLD",score,contrib
-
-def update_weights(symbol, weights):
-    ref=db.reference(f"history/{symbol}")
-    data=list((ref.get() or {}).values())
-    if len(data)<2: return weights
-    prev,curr=data[-2],data[-1]
-    actual_up = curr["price"]>prev["price"]
-    lr=0.03
-    for key in weights:
-        contrib=prev.get("contributions",{}).get(key,0)
-        if contrib==0: continue
-        if (contrib>0 and actual_up) or (contrib<0 and not actual_up):
-            weights[key]*=(1+lr)
-        else:
-            weights[key]*=(1-lr)
-        weights[key]=max(0.2,min(weights[key],3))
-    return weights
-
-def save_prediction(symbol, price, pred, sig, contrib):
-    ref=db.reference(f"history/{symbol}")
-    ref.push({
-        "time":datetime.utcnow().isoformat(),
-        "price":float(price),
-        "predicted":float(pred),
-        "signal":sig,
-        "contributions":contrib
-    })
 
 def calculate_win_rate(symbol):
     ref=db.reference(f"history/{symbol}")
@@ -223,9 +193,39 @@ def calculate_confidence(upper, lower, price):
 # =========================
 st.title("🚀 AI Crypto Bot")
 
-timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day","Weekly"])
+# Portfolio Sidebar
+st.sidebar.header("💰 Portfolio Tracker")
 COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
+portfolio = {}
+for sym in COINS:
+    col1, col2 = st.sidebar.columns(2)
+    amount = col1.number_input(f"{sym} Amount", min_value=0.0, step=0.01, key=f"{sym}_amt")
+    buy_price = col2.number_input(f"{sym} Buy Price", min_value=0.0, step=0.01, key=f"{sym}_buy")
+    if amount>0 and buy_price>0:
+        portfolio[sym] = {"amount": amount, "buy_price": buy_price}
+
+timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day","Weekly"])
 symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
+
+tooltip = {
+    "Signal":"AI trading signal: BUY, SELL, or HOLD based on indicators",
+    "Score":"Aggregated score from RSI, MACD, Trend, Sentiment",
+    "WinRate":"Historical accuracy percentage of previous signals",
+    "Confidence":"Forecast reliability percentage based on upper/lower bounds",
+    "RSI":"Relative Strength Index (<30 oversold, >70 overbought)",
+    "MACD":"MACD vs Signal line; trend momentum indicator",
+    "Sentiment":"Average sentiment score from recent news"
+}
+
+# Forecast step mapping based on timeframe
+step_mapping = {
+    "15 Min": timedelta(minutes=15),
+    "Hourly": timedelta(hours=1),
+    "Daily": timedelta(days=1),
+    "3-Day": timedelta(days=3),
+    "Weekly": timedelta(weeks=1)
+}
+forecast_step = step_mapping[timeframe]
 
 for sym in symbols:
     data, source = get_ohlc(sym, timeframe)
@@ -233,7 +233,6 @@ for sym in symbols:
         st.error(f"{sym} failed to fetch data from all sources")
         continue
     fd,o,h,l,c,v = data
-    next_p = arima_forecast(c,1)[0]
     rsi = calculate_rsi(c)
     macd_v, sig_line = calculate_macd(c)
     sentiment = get_sentiment()
@@ -241,57 +240,57 @@ for sym in symbols:
     sig,score,con = smart_signal(c,rsi,macd_v,sig_line,sentiment,weights)
     wr = calculate_win_rate(sym)
     conf = calculate_confidence(max(c), min(c), c[-1])
+    steps = 5
+    future_dates = [fd[-1] + forecast_step*(i+1) for i in range(steps)]
+    future_prices = arima_forecast(c, steps)
 
-    # Two-column layout
-    col_chart, col_stats = st.columns([3,1])
-
-    # --- Chart ---
-    with col_chart:
-        color = "green" if next_p>c[-1] else "red"
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
-                                     increasing_line_color='green',
-                                     decreasing_line_color='red',
-                                     name="Price"))
-        fig.add_trace(go.Scatter(x=[fd[-1],fd[-1]+timedelta(hours=1)],
-                                 y=[c[-1],next_p],
-                                 mode="lines", line=dict(color=color, width=3),
-                                 name="Forecast"))
-        fig.update_layout(
-            dragmode=False,
-            margin=dict(l=20,r=20,t=30,b=20),
-            updatemenus=[dict(type="buttons", y=1, x=1.05, showactive=False, buttons=[
-                dict(label="+", method="relayout", args=["xaxis.range[1]", fd[-1]]),
-                dict(label="-", method="relayout", args=["xaxis.range[0]", fd[0]])
-            ])]
+    # Coin Box
+    with st.container():
+        st.markdown(
+            f"<div style='border:1px solid white; padding:10px; border-radius:8px; margin-bottom:10px;'>",
+            unsafe_allow_html=True
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        st.caption(f"Source: {source}")
+        st.markdown(f"### {sym}")
 
-    # --- Stats Panel ---
-    tooltip = {
-        "Signal":"AI trading signal: BUY, SELL, or HOLD based on indicators",
-        "Score":"Aggregated score from RSI, MACD, Trend, Sentiment",
-        "WinRate":"Historical accuracy percentage of previous signals",
-        "Confidence":"Forecast reliability percentage based on upper/lower bounds",
-        "RSI":"Relative Strength Index (<30 oversold, >70 overbought)",
-        "MACD":"MACD vs Signal line; trend momentum indicator",
-        "Sentiment":"Average sentiment score from recent news"
-    }
+        # Chart + Stats Layout
+        col_chart, col_stats = st.columns([3,1])
 
-    with col_stats:
-        st.markdown(f"### {sym} Stats")
-        st.markdown(f"<span title='{tooltip['Signal']}'>**Signal:**</span> {sig}", unsafe_allow_html=True)
-        st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
-        st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {wr}%", unsafe_allow_html=True)
-        st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
-        st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
-        st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
-        st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
+        # --- Chart ---
+        with col_chart:
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
+                                         increasing_line_color='green',
+                                         decreasing_line_color='red',
+                                         name="Price"))
+            fig.add_trace(go.Scatter(
+                x=future_dates, y=future_prices,
+                mode="lines+markers",
+                line=dict(color="yellow", width=3),
+                marker=dict(size=6, symbol="circle"),
+                name="Forecast"
+            ))
+            fig.update_layout(
+                dragmode=False,
+                margin=dict(l=20,r=20,t=30,b=20)
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            st.caption(f"Source: {source}")
 
-# =========================
-# 🧰 DEBUG PANEL
-# =========================
-with st.expander("🧰 Debug Panel"):
-    st.write("Selected Timeframe:", timeframe)
-    st.write("Session State:", st.session_state)
+        # --- Stats Panel ---
+        with col_stats:
+            st.markdown(f"<span title='{tooltip['Signal']}'>**Signal:**</span> {sig}", unsafe_allow_html=True)
+            st.markdown(f"<span title='{tooltip['Score']}'>**Score:**</span> {score}", unsafe_allow_html=True)
+            st.markdown(f"<span title='{tooltip['WinRate']}'>**WinRate:**</span> {wr}%", unsafe_allow_html=True)
+            st.markdown(f"<span title='{tooltip['Confidence']}'>**Confidence:**</span> {conf}%", unsafe_allow_html=True)
+            st.markdown(f"<span title='{tooltip['RSI']}'>**RSI:**</span> {round(rsi[-1],2)}", unsafe_allow_html=True)
+            st.markdown(f"<span title='{tooltip['MACD']}'>**MACD:**</span> {round(macd_v[-1],2)} / {round(sig_line[-1],2)}", unsafe_allow_html=True)
+            st.markdown(f"<span title='{tooltip['Sentiment']}'>**Sentiment:**</span> {round(sentiment,2)}", unsafe_allow_html=True)
+
+            # --- Portfolio P/L ---
+            if sym in portfolio:
+                info = portfolio[sym]
+                profit_loss = (c[-1]-info["buy_price"])*info["amount"]
+                pl_color = "green" if profit_loss>=0 else "red"
+                st.markdown(f"<span>**Portfolio P/L:**</span> <span style='color:{pl_color}'>${profit_loss:.2f}</span>", unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
