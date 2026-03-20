@@ -119,8 +119,7 @@ else:
     # HEAVY CALCULATION every 5 min
     # =========================
     now=datetime.utcnow()
-    global last_heavy_update
-    if (now-last_heavy_update).total_seconds()>300 or last_heavy_update==datetime.min:
+    if (now - last_heavy_update).total_seconds() > 300 or last_heavy_update == datetime.min:
         try:
             model,scaler=train_lstm(c)
             pred=lstm_predict(model,scaler,c)
