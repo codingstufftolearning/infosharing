@@ -4,17 +4,17 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading, websocket, time as t
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Input
 from sklearn.linear_model import LogisticRegression
 
 # =========================
-# SAFE AUTO REFRESH
+# AUTO REFRESH
 # =========================
 if "loading" not in st.session_state:
     st.session_state.loading = False
@@ -57,7 +57,7 @@ def start_ws(symbol):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# FETCH OHLC DATA (MULTI SOURCE)
+# FETCH OHLC DATA
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     bases = ["https://api.binance.com","https://api1.binance.com"]
@@ -161,23 +161,23 @@ def calculate_macd(prices):
 @st.cache_resource(ttl=3600)
 def train_lstm(prices):
     if len(prices)<30: return None, None
-    scaler=MinMaxScaler()
-    data=scaler.fit_transform(np.array(prices).reshape(-1,1))
-    X,y=[],[]
-    for i in range(20,len(data)):
+    scaler = MinMaxScaler()
+    data = scaler.fit_transform(np.array(prices).reshape(-1,1))
+    X, y = [], []
+    for i in range(20, len(data)):
         X.append(data[i-20:i])
         y.append(data[i])
-    X,y=np.array(X),np.array(y)
-    model=Sequential([LSTM(50,input_shape=(20,1)),Dense(1)])
-    model.compile("adam","mse")
-    model.fit(X,y,epochs=3,verbose=0)
-    return model,scaler
+    X, y = np.array(X), np.array(y)
+    model = Sequential([Input(shape=(20,1)), LSTM(50), Dense(1)])
+    model.compile(optimizer="adam", loss="mse")
+    model.fit(X, y, epochs=3, verbose=0)
+    return model, scaler
 
-def lstm_predict(model,scaler,prices):
+def lstm_predict(model, scaler, prices):
     if model is None or scaler is None: return prices[-1]
-    data=scaler.transform(np.array(prices).reshape(-1,1))
-    seq=data[-20:]
-    pred=model.predict(seq.reshape(1,20,1),verbose=0)
+    data = scaler.transform(np.array(prices).reshape(-1,1))
+    seq = data[-20:]
+    pred = model.predict(seq.reshape(1,20,1), verbose=0)
     return scaler.inverse_transform(pred)[0][0]
 
 # =========================
@@ -217,18 +217,15 @@ def get_sentiment():
         return 0
 
 # =========================
-# SPIKE DETECTION
+# SPIKE / SUPPORT
 # =========================
 def detect_spike(prices):
     if len(prices)<5: return "Normal"
-    change=(prices[-1]-prices[-5])/prices[-5]
+    change = (prices[-1]-prices[-5])/prices[-5]
     if change<-0.05: return "🔻 Sharp Drop"
     if change>0.05: return "🚀 Sharp Rise"
     return "Normal"
 
-# =========================
-# SUPPORT / RESISTANCE
-# =========================
 def support_resistance(prices):
     if len(prices)<50: return min(prices), max(prices)
     return min(prices[-50:]), max(prices[-50:])
@@ -236,9 +233,10 @@ def support_resistance(prices):
 # =========================
 # UI
 # =========================
-st.title("🚀 AI Crypto Bot Merged")
+st.title("🚀 AI Crypto Bot Fixed")
 
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","MATICUSDT","XAIUSD"]
+# Limit default coins to 5 to reduce memory
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
 
 # Portfolio Sidebar
 st.sidebar.header("💰 Portfolio Tracker")
@@ -252,13 +250,10 @@ for sym in COINS:
         portfolio[sym] = {"amount": amt, "buy_price": buy_price, "pl":0}
 
 timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily","3-Day"])
-symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
+symbols = st.multiselect("Select Coins", COINS, default=COINS)
 
 debug_info = []
 
-# =========================
-# Process Each Coin
-# =========================
 st.session_state.loading = True
 for sym in symbols:
     try:
@@ -278,10 +273,15 @@ for sym in symbols:
         rsi = calculate_rsi(c)
         macd_v, sig_line = calculate_macd(c)
         sentiment = get_sentiment()
+
+        # AI & LSTM
         ai_model = train_ai(c)
         ai_prob = ai_predict(ai_model,c)
-        lstm_model, lstm_scaler = train_lstm(c)
-        lstm_pred = lstm_predict(lstm_model,lstm_scaler,c)
+        try:
+            lstm_model, lstm_scaler = train_lstm(c)
+            lstm_pred = lstm_predict(lstm_model,lstm_scaler,c)
+        except:
+            lstm_pred = c[-1]
 
         # Signal
         trend = (c[-1]-np.mean(c))/np.std(c) if np.std(c)>0 else 0
@@ -292,23 +292,18 @@ for sym in symbols:
         sup,res = support_resistance(c)
         spike = detect_spike(c)
 
-        # =========================
-        # Coin Card Container
-        # =========================
+        # Coin Container
         with st.container():
             st.markdown("<div style='border:1px solid white; padding:10px; border-radius:8px; margin-bottom:10px;'>", unsafe_allow_html=True)
             st.markdown(f"### {sym} ({source})")
             col_chart, col_stats = st.columns([3,1])
 
-            # Sparkline
             with col_chart:
                 spark_fig = go.Figure()
                 spark_fig.add_trace(go.Scatter(x=fd, y=c, mode="lines", line=dict(color="cyan", width=2)))
                 spark_fig.update_layout(height=80, margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(showticklabels=False), yaxis=dict(showticklabels=False))
                 st.plotly_chart(spark_fig, use_container_width=True, config={"displayModeBar":False})
 
-            # Candlestick + LSTM Prediction Line
-            with col_chart:
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c,
                                              increasing_line_color='green', decreasing_line_color='red', name="Price"))
@@ -343,14 +338,10 @@ for sym in symbols:
 
 st.session_state.loading = False
 
-# =========================
 # Portfolio Summary
-# =========================
 st.sidebar.markdown(f"### Total Portfolio P/L: ${round(total_pl,2)}")
 
-# =========================
 # Debug Panel
-# =========================
 with st.expander("🧰 Debug Panel"):
     for line in debug_info:
         st.write(line)
