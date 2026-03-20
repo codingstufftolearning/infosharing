@@ -6,23 +6,49 @@ import requests
 import plotly.graph_objects as go
 from datetime import datetime
 import threading, websocket, time as t
+
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.linear_model import LogisticRegression
 
+import firebase_admin
+from firebase_admin import credentials, db
+
 # =========================
 # AUTO REFRESH
 # =========================
-if "loading" not in st.session_state:
-    st.session_state.loading = False
+st_autorefresh(interval=300000, key="refresh")
 
-if not st.session_state.loading:
-    st_autorefresh(interval=300000, key="refresh")
+# =========================
+# FIREBASE INIT
+# =========================
+if not firebase_admin._apps:
+    try:
+        firebase_dict = dict(st.secrets["firebase"])
+        firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
+        cred = credentials.Certificate(firebase_dict)
+        firebase_admin.initialize_app(cred, {
+            "databaseURL": firebase_dict["databaseURL"]
+        })
+    except Exception as e:
+        st.error(f"Firebase error: {e}")
 
 # =========================
 # GLOBALS
 # =========================
 ws_prices = {}
+
+# =========================
+# SESSION INIT
+# =========================
+if "balance" not in st.session_state:
+    st.session_state.balance = 10000
+
+if "positions" not in st.session_state:
+    st.session_state.positions = {}
+
+if "trade_history" not in st.session_state:
+    st.session_state.trade_history = []
 
 # =========================
 # SAFE REQUEST
@@ -33,13 +59,13 @@ def safe_request(url, params=None):
             r = requests.get(url, params=params, timeout=10)
             if r.status_code == 200:
                 return r.json()
-            t.sleep(2*(i+1))
+            t.sleep(2)
         except:
             t.sleep(1)
     return None
 
 # =========================
-# WEBSOCKET PRICE
+# WEBSOCKET
 # =========================
 def start_ws(symbol):
     def on_message(ws, message):
@@ -49,196 +75,235 @@ def start_ws(symbol):
                 ws_prices[symbol] = float(data["c"])
         except:
             pass
+
     url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# FETCH DATA
+# MULTI TF DATA
 # =========================
-def get_ohlc(symbol, timeframe):
-    mapping = {"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
-    interval, limit = mapping[timeframe]
+def get_multi_tf(symbol):
+    tfs = {
+        "15m": ("15m", 96),
+        "1h": ("1h", 72),
+        "4h": ("4h", 60)
+    }
 
-    url = "https://api.binance.com/api/v3/klines"
-    data = safe_request(url, {"symbol":symbol,"interval":interval,"limit":limit})
-    if not data:
-        return None
+    results = {}
 
-    d,o,h,l,c,v=[],[],[],[],[],[]
-    for k in data:
-        d.append(datetime.fromtimestamp(k[0]/1000))
-        o.append(float(k[1]))
-        h.append(float(k[2]))
-        l.append(float(k[3]))
-        c.append(float(k[4]))
-        v.append(float(k[5]))
+    for tf, (interval, limit) in tfs.items():
+        url = "https://api.binance.com/api/v3/klines"
+        data = safe_request(url, {"symbol":symbol,"interval":interval,"limit":limit})
+        if not data:
+            return None
 
-    return d,o,h,l,c,v
+        closes = [float(k[4]) for k in data]
+        volumes = [float(k[5]) for k in data]
+
+        results[tf] = (np.array(closes), volumes, data)
+
+    return results
 
 # =========================
 # INDICATORS
 # =========================
-def calculate_rsi(prices, period=14):
+def rsi(prices):
     delta = np.diff(prices)
     gain = np.maximum(delta,0)
     loss = np.abs(np.minimum(delta,0))
-    avg_gain = pd.Series(gain).rolling(period,min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(period,min_periods=1).mean()
-    rs = avg_gain/(avg_loss+1e-9)
+    rs = pd.Series(gain).rolling(14).mean() / (pd.Series(loss).rolling(14).mean()+1e-9)
     return np.concatenate([[50],100-(100/(1+rs))])
 
-def calculate_macd(prices):
-    exp1 = pd.Series(prices).ewm(span=12, adjust=False).mean()
-    exp2 = pd.Series(prices).ewm(span=26, adjust=False).mean()
-    macd = exp1 - exp2
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd.values, signal.values
+def macd(prices):
+    exp1 = pd.Series(prices).ewm(span=12).mean()
+    exp2 = pd.Series(prices).ewm(span=26).mean()
+    m = exp1-exp2
+    s = m.ewm(span=9).mean()
+    return m.values, s.values
 
 # =========================
-# AI MODEL (LIGHTWEIGHT)
+# AI
 # =========================
 def train_ai(prices):
     if len(prices)<50:
         return None
-
-    X=[]; y=[]
+    X,y=[],[]
     for i in range(20,len(prices)-1):
         w = prices[i-20:i]
         X.append([np.mean(w),np.std(w),w[-1]-w[0]])
         y.append(1 if prices[i+1]>prices[i] else 0)
+    m = LogisticRegression()
+    m.fit(X,y)
+    return m
 
-    model = LogisticRegression()
-    model.fit(X,y)
-    return model
-
-def ai_predict(model, prices):
-    if model is None or len(prices)<20:
+def ai_predict(m, prices):
+    if not m or len(prices)<20:
         return 0.5
     w = prices[-20:]
-    return model.predict_proba([[np.mean(w),np.std(w),w[-1]-w[0]]])[0][1]
+    return m.predict_proba([[np.mean(w),np.std(w),w[-1]-w[0]]])[0][1]
 
 # =========================
-# SENTIMENT
+# SIGNAL
 # =========================
-@st.cache_data(ttl=900)
-def get_sentiment():
+def generate_signal(c, v):
+    r = rsi(c)
+    m, s = macd(c)
+    ai = ai_predict(train_ai(c), c)
+
+    if r[-1] < 35 and m[-1] > s[-1] and ai > 0.55:
+        return "BUY"
+    if r[-1] > 65 and m[-1] < s[-1] and ai < 0.45:
+        return "SELL"
+    return "HOLD"
+
+def multi_tf_signal(symbol):
+    data = get_multi_tf(symbol)
+    if not data:
+        return "HOLD"
+
+    signals = []
+    for tf in data:
+        c, v, _ = data[tf]
+        signals.append(generate_signal(c, v))
+
+    if signals.count("BUY") >= 2:
+        return "BUY"
+    if signals.count("SELL") >= 2:
+        return "SELL"
+    return "HOLD"
+
+# =========================
+# TRADING ENGINE
+# =========================
+RISK = 0.1
+
+def open_position(sym, signal, price):
+    capital = st.session_state.balance * RISK
+
+    st.session_state.positions[sym] = {
+        "type": "LONG" if signal=="BUY" else "SHORT",
+        "entry": price,
+        "size": capital,
+        "sl": price*0.97 if signal=="BUY" else price*1.03,
+        "tp": price*1.05 if signal=="BUY" else price*0.95
+    }
+
+def close_position(sym, price):
+    pos = st.session_state.positions.get(sym)
+    if not pos:
+        return
+
+    entry = pos["entry"]
+    size = pos["size"]
+
+    if pos["type"]=="LONG":
+        pct = (price-entry)/entry
+    else:
+        pct = (entry-price)/entry
+
+    profit = size * pct
+    st.session_state.balance += profit
+
+    trade = {
+        "symbol": sym,
+        "type": pos["type"],
+        "entry": entry,
+        "exit": price,
+        "profit": profit,
+        "time": str(datetime.now())
+    }
+
+    st.session_state.trade_history.append(trade)
+
+    # SAVE TO FIREBASE
     try:
-        data = safe_request("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
-        scores=[]
-        for a in data.get("Data",[])[:5]:
-            text = a.get("title","")
-            v = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
-            b = TextBlob(text).sentiment.polarity
-            scores.append((v+b)/2)
-        return np.mean(scores) if scores else 0
+        db.reference("trades").push(trade)
     except:
-        return 0
+        pass
 
-# =========================
-# SMART SIGNAL SYSTEM
-# =========================
-def get_trend(prices):
-    s = pd.Series(prices)
-    ema50 = s.ewm(span=50).mean()
-    ema200 = s.ewm(span=200).mean()
-    return "UP" if ema50.iloc[-1] > ema200.iloc[-1] else "DOWN"
-
-def volume_boost(volumes):
-    if len(volumes)<20:
-        return False
-    return volumes[-1] > np.mean(volumes[-20:]) * 1.5
-
-def get_volatility(prices):
-    return np.std(prices)/prices[-1]
-
-def generate_signal(c, v, rsi, macd, signal_line, ai_prob):
-    trend = get_trend(c)
-    vol_ok = volume_boost(v)
-    volatility = get_volatility(c)
-
-    macd_up = macd[-1]>signal_line[-1] and macd[-2]<=signal_line[-2]
-    macd_down = macd[-1]<signal_line[-1] and macd[-2]>=signal_line[-2]
-
-    signal = "HOLD"
-
-    if volatility < 0.005:
-        return "HOLD", trend, volatility
-
-    if rsi[-1]<35 and macd_up and ai_prob>0.55:
-        signal = "STRONG BUY" if trend=="UP" and vol_ok else "BUY"
-
-    elif rsi[-1]>65 and macd_down and ai_prob<0.45:
-        signal = "STRONG SELL" if trend=="DOWN" and vol_ok else "SELL"
-
-    return signal, trend, volatility
-
-def calculate_confidence(rsi, ai_prob, volatility):
-    rsi_score = 1 - abs(rsi[-1]-50)/50
-    vol_score = max(0, 1 - volatility*10)
-    return max(0,min(100,(ai_prob*0.5 + rsi_score*0.3 + vol_score*0.2)*100))
+    del st.session_state.positions[sym]
 
 # =========================
 # UI
 # =========================
-st.title("🚀 AI Crypto Bot PRO")
+st.title("🚀 AI Crypto Bot PRO DEMO")
 
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT"]
 
-timeframe = st.selectbox("Timeframe", ["15 Min","Hourly","Daily"])
-symbols = st.multiselect("Coins", COINS, default=COINS[:2])
+st.sidebar.header("🧪 Demo Trading")
 
-st.session_state.loading = True
+if st.sidebar.button("Reset"):
+    st.session_state.balance = 10000
+    st.session_state.positions = {}
+    st.session_state.trade_history = []
 
-for sym in symbols:
+st.sidebar.write(f"Balance: ${round(st.session_state.balance,2)}")
+st.sidebar.write(f"Open Positions: {len(st.session_state.positions)}")
+
+# =========================
+# MAIN LOOP
+# =========================
+for sym in COINS:
 
     if sym not in ws_prices:
         start_ws(sym)
 
-    data = get_ohlc(sym, timeframe)
+    data = get_multi_tf(sym)
     if not data:
         continue
 
-    fd,o,h,l,c,v = data
-    c = np.array(c)
+    c = data["15m"][0]
+    raw = data["15m"][2]
 
-    # Indicators
-    rsi = calculate_rsi(c)
-    macd, signal_line = calculate_macd(c)
-    sentiment = get_sentiment()
-    ai_model = train_ai(c)
-    ai_prob = ai_predict(ai_model,c)
+    fd = [datetime.fromtimestamp(k[0]/1000) for k in raw]
+    o = [float(k[1]) for k in raw]
+    h = [float(k[2]) for k in raw]
+    l = [float(k[3]) for k in raw]
 
-    # Smart Signal
-    signal, trend, volatility = generate_signal(c, v, rsi, macd, signal_line, ai_prob)
-    confidence = calculate_confidence(rsi, ai_prob, volatility)
+    signal = multi_tf_signal(sym)
+    price = c[-1]
 
-    # UI Card
+    # Trading logic
+    pos = st.session_state.positions.get(sym)
+
+    if not pos and signal in ["BUY","SELL"]:
+        open_position(sym, signal, price)
+
+    if pos:
+        if pos["type"]=="LONG" and (price<=pos["sl"] or price>=pos["tp"]):
+            close_position(sym, price)
+        elif pos["type"]=="SHORT" and (price>=pos["sl"] or price<=pos["tp"]):
+            close_position(sym, price)
+
+    # UI
     with st.container():
-        st.markdown("<div style='border:1px solid white;padding:10px;border-radius:8px;margin-bottom:10px;'>",unsafe_allow_html=True)
         st.markdown(f"### {sym}")
-
         col1,col2 = st.columns([3,1])
 
         with col1:
             fig = go.Figure()
             fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
-            fig.update_layout(dragmode="zoom")
             st.plotly_chart(fig,use_container_width=True)
 
         with col2:
-            color = "white"
-            if "BUY" in signal: color="green"
-            if "SELL" in signal: color="red"
+            st.write(f"Signal: {signal}")
+            st.write(f"Price: {round(price,2)}")
 
-            st.markdown(f"**Signal:** <span style='color:{color}'>{signal}</span>", unsafe_allow_html=True)
-            st.write(f"Trend: {trend}")
-            st.write(f"Confidence: {round(confidence,2)}%")
-            st.write(f"RSI: {round(rsi[-1],2)}")
-            st.write(f"AI: {round(ai_prob*100,2)}%")
-            st.write(f"Volatility: {round(volatility,4)}")
-            st.write(f"Sentiment: {round(sentiment,2)}")
+# =========================
+# PERFORMANCE
+# =========================
+trades = st.session_state.trade_history
 
-        st.markdown("</div>",unsafe_allow_html=True)
+if trades:
+    wins = sum(1 for t in trades if t["profit"]>0)
+    total = len(trades)
+    winrate = wins/total*100
+    profit = sum(t["profit"] for t in trades)
 
-st.session_state.loading = False
+    st.markdown("### 📊 Performance")
+    st.write(f"Trades: {total}")
+    st.write(f"Winrate: {round(winrate,2)}%")
+    st.write(f"Profit: ${round(profit,2)}")
+
+    st.dataframe(pd.DataFrame(trades).tail(10))
