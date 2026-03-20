@@ -14,29 +14,36 @@ from tensorflow.keras.layers import LSTM, Dense
 import sqlite3
 
 # =========================
-# DATABASE
+# DATABASE SETUP
 # =========================
-conn = sqlite3.connect("trades.db", check_same_thread=False)
+conn = sqlite3.connect("trade_history.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS trades (
     timestamp TEXT,
-    symbol TEXT,
-    trade_type TEXT,
-    price REAL,
+    coin TEXT,
+    mode TEXT,
+    action TEXT,
     amount REAL,
-    mode TEXT
+    entry_price REAL,
+    exit_price REAL,
+    pl REAL,
+    confidence REAL,
+    tp REAL,
+    sl REAL,
+    notes TEXT
 )
 """)
 conn.commit()
 
 # =========================
-# AUTO REFRESH
+# SMART AUTO REFRESH
 # =========================
 if "loading" not in st.session_state:
     st.session_state.loading = False
+
 if not st.session_state.loading:
-    st_autorefresh(interval=300000, key="refresh")  # 5 minutes
+    st_autorefresh(interval=300000, key="refresh")  # every 5 minutes
 
 # =========================
 # GLOBALS
@@ -44,7 +51,7 @@ if not st.session_state.loading:
 ws_prices = {}
 
 # =========================
-# WEBSOCKET
+# WEBSOCKET LIVE PRICE
 # =========================
 def start_ws(symbol):
     def on_message(ws, message):
@@ -60,7 +67,7 @@ def start_ws(symbol):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# DATA FETCHING (OLD WAY)
+# FETCHING DATA (OLD STABLE WAY)
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
@@ -238,19 +245,16 @@ def detect_event():
 st.title("🚀 AI Crypto Bot Demo")
 
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
-
 timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
 symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT","ETHUSDT"])
-
 debug=[]
+
+st.session_state.loading = True  # lock
 
 # =========================
 # MAIN LOOP
 # =========================
-st.session_state.loading = True
-
 for sym in symbols:
-
     if sym not in ws_prices:
         start_ws(sym)
 
@@ -272,7 +276,7 @@ for sym in symbols:
     conf=100*(1-np.std(c)/c[-1])
 
     # =========================
-    # CHART & DEMO PANEL
+    # CHART + DEMO PANEL
     # =========================
     with st.container():
         st.markdown("<div style='border:1px solid white;padding:10px;border-radius:8px;margin-bottom:10px;'>",unsafe_allow_html=True)
@@ -296,35 +300,43 @@ for sym in symbols:
             st.write(f"Spike: {spike}")
             st.write(f"Events: {events}")
 
-        # =========================
-        # DEMO TRADING PANEL
-        # =========================
-        st.markdown("#### Demo Trading")
-        mode = st.selectbox("Mode", ["Trade","Future"], key=f"{sym}_mode")
+        st.markdown("### Demo Trade Panel")
+        mode=st.selectbox("Mode",["Trade","Future"],key=f"{sym}_mode")
+        action=None
+        entry_price=0.0
+        amount=0.0
+        tp=0.0
+        sl=0.0
 
         if mode=="Trade":
-            buy_amount = st.number_input(f"Buy Amount ({sym})",0.0,key=f"{sym}_buy_amt")
-            buy_price = st.number_input(f"Buy Price ({sym})",0.0,key=f"{sym}_buy_price")
-            if st.button(f"Buy {sym}",key=f"{sym}_buy_btn"):
-                cursor.execute("INSERT INTO trades VALUES (?,?,?,?,?,?)", 
-                               (str(datetime.now()),sym,"BUY",buy_price,buy_amount,"Trade"))
-                conn.commit()
-                st.success(f"Bought {buy_amount} {sym} at {buy_price}")
+            action=st.selectbox("Action",["BUY","SELL"],key=f"{sym}_trade_action")
+            amount=st.number_input("Amount (Coin)",0.0,key=f"{sym}_trade_amount")
         else:
-            direction = st.radio("Direction", ["Long","Short"], key=f"{sym}_future_dir")
-            amount = st.number_input(f"Amount ({sym})",0.0,key=f"{sym}_future_amt")
-            price = st.number_input(f"Entry Price ({sym})",0.0,key=f"{sym}_future_price")
-            tp = st.number_input("Take Profit %",0.0,key=f"{sym}_tp")
-            sl = st.number_input("Stop Loss %",0.0,key=f"{sym}_sl")
-            if st.button(f"Open {direction} {sym}",key=f"{sym}_future_btn"):
-                cursor.execute("INSERT INTO trades VALUES (?,?,?,?,?,?)", 
-                               (str(datetime.now()),sym,direction,price,amount,"Future"))
-                conn.commit()
-                st.success(f"{direction} {amount} {sym} at {price} (TP:{tp}%, SL:{sl}%)")
+            action=st.selectbox("Action",["BUY LONG","SELL SHORT"],key=f"{sym}_future_action")
+            usdt_amount=st.number_input("USDT Amount",0.0,key=f"{sym}_future_amount")
+            entry_price=st.number_input("Entry Price",0.0,key=f"{sym}_future_entry")
+            tp=st.number_input("Take Profit %",0.0,key=f"{sym}_future_tp")
+            sl=st.number_input("Stop Loss %",0.0,key=f"{sym}_future_sl")
+            if entry_price>0:
+                amount=usdt_amount/entry_price
+
+        if st.button("Execute Demo Trade",key=f"{sym}_execute"):
+            pl=0.0
+            if action in ["SELL","SELL SHORT"]:
+                pl=(c[-1]-entry_price)*amount if entry_price>0 else 0.0
+            cursor.execute("INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (datetime.now().isoformat(),sym,mode,action,amount,entry_price,c[-1],pl,conf,tp,sl,"demo trade"))
+            conn.commit()
+            st.success(f"Trade executed: {action} {amount} {sym} at {entry_price}")
 
         st.markdown("</div>",unsafe_allow_html=True)
 
-st.session_state.loading = False
+# =========================
+# TRADE HISTORY PANEL
+# =========================
+st.markdown("### Trade History")
+df=pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC",conn)
+st.dataframe(df)
 
 # =========================
 # DEBUG PANEL
@@ -335,3 +347,5 @@ with st.expander("🧰 Debug Panel"):
     else:
         for d in debug:
             st.write(d)
+
+st.session_state.loading = False
