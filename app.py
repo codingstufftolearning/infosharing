@@ -13,17 +13,22 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 
 # =========================
-# AUTO REFRESH
+# SMART AUTO REFRESH
 # =========================
-st_autorefresh(interval=5000, key="refresh")
+if "loading" not in st.session_state:
+    st.session_state.loading = False
+
+# Refresh only if not loading
+if not st.session_state.loading:
+    st_autorefresh(interval=300000, key="refresh")  # 5 minutes
 
 # =========================
-# GLOBAL
+# GLOBALS
 # =========================
 ws_prices = {}
 
 # =========================
-# WEBSOCKET
+# WEBSOCKET LIVE PRICE
 # =========================
 def start_ws(symbol):
     def on_message(ws, message):
@@ -39,17 +44,15 @@ def start_ws(symbol):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# FETCH (STABLE OLD WAY)
+# FETCHING DATA (OLD STABLE WAY)
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         data = requests.get(url, params=params, timeout=5).json()
-
         if not isinstance(data, list):
             return None
-
         d,o,h,l,c,v = [],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]/1000))
@@ -58,7 +61,6 @@ def get_ohlc_binance(symbol, interval, limit):
             l.append(float(k[3]))
             c.append(float(k[4]))
             v.append(float(k[5]))
-
         return d,o,h,l,c,v
     except:
         return None
@@ -66,20 +68,16 @@ def get_ohlc_binance(symbol, interval, limit):
 def get_ohlc_cryptocompare(symbol, interval, limit):
     try:
         fsym = symbol.replace("USDT","")
-
-        if interval == "15m":
+        if interval=="15m":
             url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={fsym}&tsym=USD&limit={limit}&aggregate=15"
-        elif interval == "1h":
+        elif interval=="1h":
             url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={limit}"
         else:
             url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
-
         data = requests.get(url, timeout=5).json()
         raw = data.get("Data", {}).get("Data", [])
-
         if not raw:
             return None
-
         d,o,h,l,c,v = [],[],[],[],[],[]
         for x in raw:
             d.append(datetime.fromtimestamp(x["time"]))
@@ -88,7 +86,6 @@ def get_ohlc_cryptocompare(symbol, interval, limit):
             l.append(x["low"])
             c.append(x["close"])
             v.append(x.get("volumeto",0))
-
         return d,o,h,l,c,v
     except:
         return None
@@ -98,52 +95,40 @@ def get_ohlc_coingecko(symbol):
         coin = symbol.replace("USDT","").lower()
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=365"
         data = requests.get(url, timeout=5).json()
-
         prices = data.get("prices", [])
         if not prices:
             return None
-
         d,o,h,l,c,v = [],[],[],[],[],[]
         for i in range(1,len(prices)):
             t = datetime.fromtimestamp(prices[i][0]/1000)
             prev = prices[i-1][1]
             curr = prices[i][1]
-
             d.append(t)
             o.append(prev)
             h.append(max(prev,curr))
             l.append(min(prev,curr))
             c.append(curr)
             v.append(0)
-
         return d,o,h,l,c,v
     except:
         return None
 
 def get_ohlc(symbol, timeframe, debug):
-    mapping = {
-        "15 Min": ("15m", 96),
-        "Hourly": ("1h", 72),
-        "Daily": ("1d", 180)
-    }
-
+    mapping = {"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
     interval, limit = mapping[timeframe]
 
     data = get_ohlc_binance(symbol, interval, limit)
     if data:
         debug.append(f"{symbol}: Binance OK")
         return data
-
     data = get_ohlc_cryptocompare(symbol, interval, limit)
     if data:
         debug.append(f"{symbol}: CryptoCompare OK")
         return data
-
     data = get_ohlc_coingecko(symbol)
     if data:
         debug.append(f"{symbol}: CoinGecko OK")
         return data
-
     debug.append(f"{symbol}: ALL SOURCES FAILED")
     return None
 
@@ -165,7 +150,7 @@ def macd(prices):
     return m.values,s.values
 
 # =========================
-# LSTM (CACHED)
+# LSTM MODEL
 # =========================
 @st.cache_resource(ttl=1800)
 def train_lstm(prices):
@@ -176,11 +161,9 @@ def train_lstm(prices):
         X.append(data[i-20:i])
         y.append(data[i])
     X,y=np.array(X),np.array(y)
-
     model=Sequential([LSTM(50,input_shape=(20,1)),Dense(1)])
     model.compile("adam","mse")
     model.fit(X,y,epochs=3,verbose=0)
-
     return model,scaler
 
 def lstm_predict(model,scaler,prices):
@@ -234,31 +217,31 @@ def detect_event():
         return []
 
 # =========================
-# UI
+# UI SETUP
 # =========================
 st.title("🚀 AI Crypto Bot")
 
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
 
-# Portfolio
-st.sidebar.header("💰 Portfolio")
+st.sidebar.header("💰 Portfolio Tracker")
 portfolio={}
 total_pl=0
 for sym in COINS:
     col1,col2=st.sidebar.columns(2)
     amt=col1.number_input(f"{sym} Amount",0.0,key=f"{sym}_amt")
-    buy=col2.number_input(f"{sym} Buy",0.0,key=f"{sym}_buy")
+    buy=col2.number_input(f"{sym} Buy Price",0.0,key=f"{sym}_buy")
     if amt>0 and buy>0:
-        portfolio[sym]=(amt,buy)
+        portfolio[sym]={"amount":amt,"buy_price":buy,"pl":0}
 
-timeframe=st.selectbox("Timeframe",["15 Min","Hourly","Daily"])
-symbols=st.multiselect("Coins",COINS,default=["BTCUSDT","ETHUSDT"])
+timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
+symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT","ETHUSDT"])
 
 debug=[]
 
 # =========================
 # MAIN LOOP
 # =========================
+st.session_state.loading = True  # start lock
 for sym in symbols:
 
     if sym not in ws_prices:
@@ -274,14 +257,11 @@ for sym in symbols:
     r=rsi(c)
     m,s=macd(c)
     sentiment=get_sentiment()
-
     model,scaler=train_lstm(c)
     pred=lstm_predict(model,scaler,c)
-
     sup,res=support_resistance(c)
     spike=detect_spike(c)
     events=detect_event()
-
     conf=100*(1-np.std(c)/c[-1])
 
     # =========================
@@ -312,16 +292,19 @@ for sym in symbols:
         st.markdown("</div>",unsafe_allow_html=True)
 
     if sym in portfolio:
-        amt,buy=portfolio[sym]
-        total_pl += (c[-1]-buy)*amt
+        amt,buy=portfolio[sym]["amount"],portfolio[sym]["buy_price"]
+        portfolio[sym]["pl"]=(c[-1]-buy)*amt
+        total_pl+=portfolio[sym]["pl"]
+
+st.session_state.loading = False  # release lock
 
 # =========================
 # PORTFOLIO SUMMARY
 # =========================
-st.sidebar.write(f"### Total P/L: ${round(total_pl,2)}")
+st.sidebar.markdown(f"### Total Portfolio P/L: ${round(total_pl,2)}")
 
 # =========================
-# DEBUG PANEL (FIXED)
+# DEBUG PANEL
 # =========================
 with st.expander("🧰 Debug Panel"):
     if not debug:
