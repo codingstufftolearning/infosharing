@@ -4,8 +4,10 @@ pandas
 numpy
 requests
 plotly
-scikit-learn
-tensorflow
-websocket-client
 textblob
 vaderSentiment
+statsmodels
+prophet
+firebase-admin
+scikit-learn
+websocket-client
