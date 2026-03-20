@@ -7,5 +7,5 @@ plotly
 textblob
 vaderSentiment
 scikit-learn
+tensorflow
 firebase-admin
-websocket-client
