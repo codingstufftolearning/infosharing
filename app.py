@@ -4,8 +4,8 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from datetime import datetime
-import threading, websocket
+from datetime import datetime, timedelta
+import threading, websocket, time
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.preprocessing import MinMaxScaler
@@ -19,6 +19,7 @@ from firebase_admin import credentials, db
 # =========================
 if "loading" not in st.session_state:
     st.session_state.loading = False
+
 if not st.session_state.loading:
     st_autorefresh(interval=300000, key="refresh")  # 5 minutes
 
@@ -38,6 +39,21 @@ if not firebase_admin._apps:
 # GLOBALS
 # =========================
 ws_prices = {}
+demo_trades = {}  # Track demo trades
+
+# =========================
+# SAFE REQUEST
+# =========================
+def safe_request(url, params=None):
+    for i in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                return r.json()
+            time.sleep(2*(i+1))
+        except:
+            time.sleep(1)
+    return None
 
 # =========================
 # WEBSOCKET LIVE PRICE
@@ -55,28 +71,16 @@ def start_ws(symbol):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# SAFE REQUEST
-# =========================
-def safe_request(url, params=None):
-    for i in range(3):
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except:
-            continue
-    return None
-
-# =========================
-# OHLC FETCHERS
+# FETCH OHLC DATA
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
         url = "https://api.binance.com/api/v3/klines"
-        data = safe_request(url, {"symbol":symbol,"interval":interval,"limit":limit})
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        data = safe_request(url, params)
         if not data:
             return None
-        d,o,h,l,c,v = [],[],[],[],[],[]
+        d,o,h,l,c,v=[],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]/1000))
             o.append(float(k[1])); h.append(float(k[2]))
@@ -118,25 +122,27 @@ def get_ohlc_coingecko(symbol):
             tstamp = datetime.fromtimestamp(prices[i][0]/1000)
             prev = prices[i-1][1]; curr = prices[i][1]
             d.append(tstamp)
-            o.append(prev)
-            h.append(max(prev,curr))
-            l.append(min(prev,curr))
-            c.append(curr)
+            o.append(prev); h.append(max(prev,curr))
+            l.append(min(prev,curr)); c.append(curr)
             v.append(0)
         return d,o,h,l,c,v
     except:
         return None
 
-def get_ohlc(symbol, timeframe):
-    mapping = {"15 Min":("15m",96),"Hourly":("1h",48),"Daily":("1d",180)}
+def get_ohlc(symbol, timeframe, debug):
+    mapping = {"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
     interval, limit = mapping[timeframe]
-    for fn in [get_ohlc_binance, get_ohlc_cryptocompare, get_ohlc_coingecko]:
+    funcs = [get_ohlc_binance, get_ohlc_cryptocompare, get_ohlc_coingecko]
+    for fn in funcs:
         try:
-            data = fn(symbol, interval, limit) if fn!=get_ohlc_coingecko else fn(symbol)
-            if data: return data, fn.__name__
+            data = fn(symbol, interval, limit) if fn != get_ohlc_coingecko else fn(symbol)
+            if data:
+                debug.append(f"{symbol}: {fn.__name__} OK")
+                return data
         except:
             continue
-    return None,"None"
+    debug.append(f"{symbol}: All sources failed")
+    return None
 
 # =========================
 # INDICATORS
@@ -167,7 +173,9 @@ def train_lstm(prices):
         X.append(data[i-20:i])
         y.append(data[i])
     X,y=np.array(X),np.array(y)
-    model=Sequential([LSTM(50,input_shape=(20,1)),Dense(1)])
+    model=Sequential()
+    model.add(LSTM(50,input_shape=(20,1)))
+    model.add(Dense(1))
     model.compile("adam","mse")
     model.fit(X,y,epochs=3,verbose=0)
     return model,scaler
@@ -187,7 +195,7 @@ def get_sentiment():
         data=safe_request("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
         scores=[]
         for a in data.get("Data",[])[:5]:
-            text = a.get("title","")
+            text=a["title"]
             v=SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
             b=TextBlob(text).sentiment.polarity
             scores.append((v+b)/2)
@@ -196,7 +204,7 @@ def get_sentiment():
         return 0
 
 # =========================
-# SUPPORT/RESISTANCE
+# SUPPORT / RESISTANCE
 # =========================
 def support_resistance(prices):
     return min(prices[-50:]), max(prices[-50:])
@@ -212,10 +220,10 @@ def detect_spike(prices):
 
 def detect_event():
     try:
-        data = safe_request("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
+        data=safe_request("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
         events=[]
         for a in data.get("Data",[])[:10]:
-            t = a.get("title","").lower()
+            t=a["title"].lower()
             if "fed" in t: events.append("Fed Impact")
             if "regulation" in t: events.append("Regulation")
         return list(set(events))
@@ -223,33 +231,59 @@ def detect_event():
         return []
 
 # =========================
-# UI START
+# DEMO TRADING FUNCTIONS
 # =========================
-st.title("🚀 AI Crypto Bot Demo")
+def open_trade(symbol, mode, price, amount, tp_perc, sl_perc, trade_type="spot"):
+    ts = datetime.now().isoformat()
+    trade = {
+        "symbol": symbol,
+        "mode": mode,
+        "trade_type": trade_type,
+        "price": price,
+        "amount": amount,
+        "tp_perc": tp_perc,
+        "sl_perc": sl_perc,
+        "timestamp": ts,
+        "status": "open"
+    }
+    if symbol not in demo_trades:
+        demo_trades[symbol] = []
+    demo_trades[symbol].append(trade)
+    # Firebase logging
+    try:
+        db.reference("demo_trades").push(trade)
+    except:
+        pass
+    return trade
+
+# =========================
+# UI SETUP
+# =========================
+st.title("🚀 AI Crypto Bot with Demo Trading")
 
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
 
-timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"], index=1)
+timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
 symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT","ETHUSDT"])
 
-st.session_state.loading = True
 debug=[]
+
+st.session_state.loading = True
 
 for sym in symbols:
     if sym not in ws_prices:
         start_ws(sym)
 
-    data, source = get_ohlc(sym, timeframe)
+    data = get_ohlc(sym,timeframe,debug)
     if not data:
-        st.warning(f"{sym}: Failed to fetch OHLC data.")
         continue
 
     fd,o,h,l,c,v = data
     c=np.array(c)
 
     r=rsi(c)
-    m,sig = macd(c)
-    sentiment = get_sentiment()
+    m,s = macd(c)
+    sentiment=get_sentiment()
     model,scaler = train_lstm(c)
     pred = lstm_predict(model,scaler,c)
     sup,res = support_resistance(c)
@@ -258,61 +292,49 @@ for sym in symbols:
     conf = 100*(1-np.std(c)/c[-1])
 
     # =========================
-    # Chart Card
+    # Coin Card
     # =========================
-    st.markdown(f"### {sym} - Chart")
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
-    fig.add_trace(go.Scatter(x=fd,y=[pred]*len(fd),line=dict(color="yellow"),name="Prediction"))
-    fig.add_hline(y=sup,line_dash="dash",line_color="green")
-    fig.add_hline(y=res,line_dash="dash",line_color="red")
-    fig.update_layout(dragmode="zoom")
-    st.plotly_chart(fig,use_container_width=True)
+    with st.container():
+        st.markdown("<div style='border:1px solid white;padding:10px;border-radius:8px;margin-bottom:10px;'>",unsafe_allow_html=True)
+        st.markdown(f"### {sym}")
 
-    # =========================
-    # Demo Trading Panel
-    # =========================
-    st.markdown(f"#### Demo Trading Panel: {sym}")
-    if sym not in st.session_state:
-        st.session_state[f"{sym}_trades"] = []
+        col1,col2 = st.columns([3,1])
+        with col1:
+            fig=go.Figure()
+            fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
+            fig.add_trace(go.Scatter(x=fd,y=[pred]*len(fd),line=dict(color="yellow"),name="Prediction"))
+            fig.add_hline(y=sup,line_dash="dash",line_color="green")
+            fig.add_hline(y=res,line_dash="dash",line_color="red")
+            fig.update_layout(dragmode="zoom")
+            st.plotly_chart(fig,use_container_width=True)
 
-    mode_key = f"{sym}_mode"
-    dir_key = f"{sym}_dir"
-    entry_key = f"{sym}_entry"
-    amt_key = f"{sym}_amt"
-    tp_key = f"{sym}_tp"
-    sl_key = f"{sym}_sl"
-    btn_key = f"{sym}_open"
+        with col2:
+            st.write(f"Prediction: {round(pred,2)}")
+            st.write(f"Confidence: {round(conf,2)}%")
+            st.write(f"Sentiment: {round(sentiment,2)}")
+            st.write(f"Spike: {spike}")
+            st.write(f"Events: {events}")
 
-    mode = st.selectbox("Mode", ["Spot","Future"], key=mode_key)
-    direction = st.selectbox("Action", ["Buy","Sell"] if mode=="Spot" else ["Long","Short"], key=dir_key)
-    entry_price = st.number_input("Entry Price", value=float(c[-1]), step=0.01, key=entry_key)
-    amount = st.number_input("Amount (USDT)", value=100.0, step=1.0, key=amt_key)
-    tp = st.number_input("Take Profit (%)", value=2.0, step=0.1, key=tp_key)
-    sl = st.number_input("Stop Loss (%)", value=1.0, step=0.1, key=sl_key)
+        # =========================
+        # DEMO TRADING PANEL
+        # =========================
+        st.markdown("#### Demo Trading Panel")
+        trade_mode = st.radio(f"Mode ({sym})", ["Buy/Sell", "Futures"], key=f"mode_{sym}")
+        price = st.number_input(f"Price ({sym})", value=float(c[-1]), key=f"price_{sym}")
+        amount = st.number_input(f"Amount ({sym})", min_value=0.0, value=1.0, key=f"amt_{sym}")
+        tp = st.number_input(f"Take Profit %", min_value=0.0, max_value=500.0, value=5.0, key=f"tp_{sym}")
+        sl = st.number_input(f"Stop Loss %", min_value=0.0, max_value=500.0, value=2.0, key=f"sl_{sym}")
+        if st.button(f"Open Trade ({sym})"):
+            t = open_trade(sym, trade_mode, price, amount, tp, sl)
+            st.success(f"Trade opened: {t}")
 
-    if st.button("Open Trade", key=btn_key):
-        trade = {
-            "mode": mode,
-            "direction": direction,
-            "entry": entry_price,
-            "amount": amount,
-            "tp": tp,
-            "sl": sl,
-            "timestamp": str(datetime.now())
-        }
-        st.session_state[f"{sym}_trades"].append(trade)
-        # Push to Firebase
-        try:
-            db.reference(f"/trades/{sym}").push(trade)
-        except:
-            pass
+        st.markdown("</div>",unsafe_allow_html=True)
+
+st.session_state.loading = False
 
 # =========================
-# Debug Panel
+# DEBUG PANEL
 # =========================
 with st.expander("🧰 Debug Panel"):
     for d in debug:
         st.write(d)
-
-st.session_state.loading = False
