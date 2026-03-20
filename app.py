@@ -15,7 +15,7 @@ from tensorflow.keras.layers import LSTM, Dense
 # GLOBALS
 # =========================
 ws_prices = {}
-last_heavy_update = datetime.min  # fixed: declare global at the top
+last_heavy_update = datetime.min
 
 # =========================
 # SMART REFRESH LOCK
@@ -34,13 +34,12 @@ def start_ws(symbol):
                 ws_prices[symbol] = float(data["c"])
         except:
             pass
-
     url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# DATA FETCHING
+# DATA FETCHING (LIMITED HISTORY)
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
@@ -60,7 +59,7 @@ def get_ohlc_binance(symbol, interval, limit):
         return None
 
 def get_ohlc(symbol, timeframe, debug):
-    mapping = {"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
+    mapping = {"15 Min":("15m",50),"Hourly":("1h",50),"Daily":("1d",50)}
     interval, limit = mapping[timeframe]
     data = get_ohlc_binance(symbol, interval, limit)
     if data:
@@ -159,6 +158,11 @@ def detect_event():
 st.title("🚀 AI Crypto Bot Live")
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
 
+# Limit max selected coins to 3 to save memory
+symbols=st.multiselect("Select Coins (max 3)", COINS, default=["BTCUSDT","ETHUSDT"])
+if len(symbols)>3:
+    st.warning("Selecting more than 3 coins may cause high memory usage!")
+
 st.sidebar.header("💰 Portfolio Tracker")
 portfolio={}
 total_pl=0
@@ -170,8 +174,6 @@ for sym in COINS:
         portfolio[sym]={"amount":amt,"buy_price":buy,"pl":0}
 
 timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
-symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT","ETHUSDT"])
-
 debug=[]
 
 # =========================
@@ -189,9 +191,9 @@ for sym in symbols:
     fd,o,h,l,c,v=data
     c=np.array(c)
 
-    # Recalculate heavy models every 5 min
+    # Heavy calculations every 5 min
     now=datetime.utcnow()
-    global last_heavy_update  # <-- already declared at top; optional here
+    global last_heavy_update
     if (now-last_heavy_update).total_seconds()>300 or last_heavy_update==datetime.min:
         model, scaler = train_lstm(c)
         pred = lstm_predict(model, scaler, c)
@@ -200,7 +202,7 @@ for sym in symbols:
         m, sig = macd(c)
         last_heavy_update = now
     else:
-        pred = c[-1]  # fallback prediction
+        pred = c[-1]  # fallback
         senti = 0
         r = np.array([50]*len(c))
         m, sig = np.zeros(len(c)), np.zeros(len(c))
@@ -219,6 +221,7 @@ for sym in symbols:
 
         with col1:
             fig=go.Figure()
+            # show only last 50 candles
             fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
             fig.add_trace(go.Scatter(x=fd,y=[pred]*len(fd),line=dict(color="yellow"),name="Prediction"))
             fig.add_hline(y=sup,line_dash="dash",line_color="green")
