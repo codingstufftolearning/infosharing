@@ -1,11 +1,10 @@
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import threading, websocket
+import threading, websocket, time
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.preprocessing import MinMaxScaler
@@ -13,19 +12,16 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 
 # =========================
-# SMART AUTO REFRESH
+# SMART REFRESH LOCK
 # =========================
 if "loading" not in st.session_state:
     st.session_state.loading = False
-
-# Refresh only if not loading
-if not st.session_state.loading:
-    st_autorefresh(interval=300000, key="refresh")  # 5 minutes
 
 # =========================
 # GLOBALS
 # =========================
 ws_prices = {}
+last_heavy_update = datetime.min
 
 # =========================
 # WEBSOCKET LIVE PRICE
@@ -44,15 +40,13 @@ def start_ws(symbol):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# FETCHING DATA (OLD STABLE WAY)
+# DATA FETCHING
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         data = requests.get(url, params=params, timeout=5).json()
-        if not isinstance(data, list):
-            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]/1000))
@@ -65,71 +59,14 @@ def get_ohlc_binance(symbol, interval, limit):
     except:
         return None
 
-def get_ohlc_cryptocompare(symbol, interval, limit):
-    try:
-        fsym = symbol.replace("USDT","")
-        if interval=="15m":
-            url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={fsym}&tsym=USD&limit={limit}&aggregate=15"
-        elif interval=="1h":
-            url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={limit}"
-        else:
-            url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
-        data = requests.get(url, timeout=5).json()
-        raw = data.get("Data", {}).get("Data", [])
-        if not raw:
-            return None
-        d,o,h,l,c,v = [],[],[],[],[],[]
-        for x in raw:
-            d.append(datetime.fromtimestamp(x["time"]))
-            o.append(x["open"])
-            h.append(x["high"])
-            l.append(x["low"])
-            c.append(x["close"])
-            v.append(x.get("volumeto",0))
-        return d,o,h,l,c,v
-    except:
-        return None
-
-def get_ohlc_coingecko(symbol):
-    try:
-        coin = symbol.replace("USDT","").lower()
-        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=365"
-        data = requests.get(url, timeout=5).json()
-        prices = data.get("prices", [])
-        if not prices:
-            return None
-        d,o,h,l,c,v = [],[],[],[],[],[]
-        for i in range(1,len(prices)):
-            t = datetime.fromtimestamp(prices[i][0]/1000)
-            prev = prices[i-1][1]
-            curr = prices[i][1]
-            d.append(t)
-            o.append(prev)
-            h.append(max(prev,curr))
-            l.append(min(prev,curr))
-            c.append(curr)
-            v.append(0)
-        return d,o,h,l,c,v
-    except:
-        return None
-
 def get_ohlc(symbol, timeframe, debug):
     mapping = {"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
     interval, limit = mapping[timeframe]
-
     data = get_ohlc_binance(symbol, interval, limit)
     if data:
         debug.append(f"{symbol}: Binance OK")
         return data
-    data = get_ohlc_cryptocompare(symbol, interval, limit)
-    if data:
-        debug.append(f"{symbol}: CryptoCompare OK")
-        return data
-    data = get_ohlc_coingecko(symbol)
-    if data:
-        debug.append(f"{symbol}: CoinGecko OK")
-        return data
-    debug.append(f"{symbol}: ALL SOURCES FAILED")
+    debug.append(f"{symbol}: Fetch failed")
     return None
 
 # =========================
@@ -196,7 +133,7 @@ def support_resistance(prices):
     return min(prices[-50:]), max(prices[-50:])
 
 # =========================
-# SPIKE + EVENT
+# SPIKE / EVENT
 # =========================
 def detect_spike(prices):
     change=(prices[-1]-prices[-5])/prices[-5]
@@ -219,8 +156,7 @@ def detect_event():
 # =========================
 # UI SETUP
 # =========================
-st.title("🚀 AI Crypto Bot")
-
+st.title("🚀 AI Crypto Bot Live")
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
 
 st.sidebar.header("💰 Portfolio Tracker")
@@ -241,32 +177,40 @@ debug=[]
 # =========================
 # MAIN LOOP
 # =========================
-st.session_state.loading = True  # start lock
-for sym in symbols:
+st.session_state.loading=True
+global last_heavy_update
 
+for sym in symbols:
     if sym not in ws_prices:
         start_ws(sym)
 
     data=get_ohlc(sym,timeframe,debug)
-    if not data:
-        continue
+    if not data: continue
 
     fd,o,h,l,c,v=data
     c=np.array(c)
 
-    r=rsi(c)
-    m,s=macd(c)
-    sentiment=get_sentiment()
-    model,scaler=train_lstm(c)
-    pred=lstm_predict(model,scaler,c)
+    # Recalculate heavy models every 5 min
+    now=datetime.utcnow()
+    if (now-last_heavy_update).total_seconds()>300 or last_heavy_update==datetime.min:
+        model,scaler=train_lstm(c)
+        pred=lstm_predict(model,scaler,c)
+        senti=get_sentiment()
+        r=rsi(c)
+        m,sig=macd(c)
+        last_heavy_update=now
+    else:
+        pred = c[-1]  # fallback prediction
+        senti=0
+        r=np.array([50]*len(c))
+        m,sig=np.zeros(len(c)),np.zeros(len(c))
+
     sup,res=support_resistance(c)
     spike=detect_spike(c)
     events=detect_event()
     conf=100*(1-np.std(c)/c[-1])
 
-    # =========================
     # CARD UI
-    # =========================
     with st.container():
         st.markdown("<div style='border:1px solid white;padding:10px;border-radius:8px;margin-bottom:10px;'>",unsafe_allow_html=True)
         st.markdown(f"### {sym}")
@@ -285,7 +229,7 @@ for sym in symbols:
         with col2:
             st.write(f"Prediction: {round(pred,2)}")
             st.write(f"Confidence: {round(conf,2)}%")
-            st.write(f"Sentiment: {round(sentiment,2)}")
+            st.write(f"Sentiment: {round(senti,2)}")
             st.write(f"Spike: {spike}")
             st.write(f"Events: {events}")
 
@@ -296,7 +240,7 @@ for sym in symbols:
         portfolio[sym]["pl"]=(c[-1]-buy)*amt
         total_pl+=portfolio[sym]["pl"]
 
-st.session_state.loading = False  # release lock
+st.session_state.loading=False
 
 # =========================
 # PORTFOLIO SUMMARY
