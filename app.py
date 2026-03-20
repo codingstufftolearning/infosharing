@@ -4,20 +4,26 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from datetime import datetime
-import threading, websocket, time as t
-
+from datetime import datetime, timedelta
+import threading, websocket
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from sklearn.linear_model import LogisticRegression
-
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 import firebase_admin
 from firebase_admin import credentials, db
+import time as t
 
 # =========================
-# AUTO REFRESH
+# SMART AUTO REFRESH
 # =========================
-st_autorefresh(interval=300000, key="refresh")
+if "loading" not in st.session_state:
+    st.session_state.loading = False
+
+# Refresh only if not loading
+if not st.session_state.loading:
+    st_autorefresh(interval=300000, key="refresh")  # 5 minutes
 
 # =========================
 # FIREBASE INIT
@@ -25,47 +31,20 @@ st_autorefresh(interval=300000, key="refresh")
 if not firebase_admin._apps:
     try:
         firebase_dict = dict(st.secrets["firebase"])
-        firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n", "\n")
+        firebase_dict["private_key"] = firebase_dict["private_key"].replace("\\n","\n")
         cred = credentials.Certificate(firebase_dict)
-        firebase_admin.initialize_app(cred, {
-            "databaseURL": firebase_dict["databaseURL"]
-        })
+        firebase_admin.initialize_app(cred, {"databaseURL": firebase_dict["databaseURL"]})
     except Exception as e:
-        st.error(f"Firebase error: {e}")
+        st.error(f"Firebase Initialization Error: {e}")
 
 # =========================
 # GLOBALS
 # =========================
 ws_prices = {}
+demo_trades = {}  # track demo trades per coin
 
 # =========================
-# SESSION INIT
-# =========================
-if "balance" not in st.session_state:
-    st.session_state.balance = 10000
-
-if "positions" not in st.session_state:
-    st.session_state.positions = {}
-
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = []
-
-# =========================
-# SAFE REQUEST
-# =========================
-def safe_request(url, params=None):
-    for i in range(3):
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-            t.sleep(2)
-        except:
-            t.sleep(1)
-    return None
-
-# =========================
-# WEBSOCKET
+# WEBSOCKET LIVE PRICE
 # =========================
 def start_ws(symbol):
     def on_message(ws, message):
@@ -75,235 +54,293 @@ def start_ws(symbol):
                 ws_prices[symbol] = float(data["c"])
         except:
             pass
-
     url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# MULTI TF DATA
+# FETCH OHLC DATA
 # =========================
-def get_multi_tf(symbol):
-    tfs = {
-        "15m": ("15m", 96),
-        "1h": ("1h", 72),
-        "4h": ("4h", 60)
-    }
+def safe_request(url, params=None):
+    for i in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code==200:
+                return r.json()
+            t.sleep(2*(i+1))
+        except:
+            t.sleep(1)
+    return None
 
-    results = {}
-
-    for tf, (interval, limit) in tfs.items():
+def get_ohlc_binance(symbol, interval, limit):
+    try:
         url = "https://api.binance.com/api/v3/klines"
-        data = safe_request(url, {"symbol":symbol,"interval":interval,"limit":limit})
-        if not data:
-            return None
+        params = {"symbol":symbol,"interval":interval,"limit":limit}
+        data = safe_request(url, params)
+        if not data: return None
+        d,o,h,l,c,v=[],[],[],[],[],[]
+        for k in data:
+            d.append(datetime.fromtimestamp(k[0]/1000))
+            o.append(float(k[1])); h.append(float(k[2]))
+            l.append(float(k[3])); c.append(float(k[4]))
+            v.append(float(k[5]))
+        return d,o,h,l,c,v
+    except:
+        return None
 
-        closes = [float(k[4]) for k in data]
-        volumes = [float(k[5]) for k in data]
+def get_ohlc_cryptocompare(symbol, interval, limit):
+    try:
+        fsym = symbol.replace("USDT","")
+        if interval=="15m":
+            url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={fsym}&tsym=USD&limit={limit}&aggregate=15"
+        elif interval=="1h":
+            url = f"https://min-api.cryptocompare.com/data/v2/histohour?fsym={fsym}&tsym=USD&limit={limit}"
+        else:
+            url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
+        data = safe_request(url)
+        raw = data.get("Data",{}).get("Data",[]) if data else []
+        d,o,h,l,c,v=[],[],[],[],[],[]
+        for x in raw:
+            d.append(datetime.fromtimestamp(x["time"]))
+            o.append(x["open"]); h.append(x["high"])
+            l.append(x["low"]); c.append(x["close"])
+            v.append(x.get("volumeto",0))
+        return d,o,h,l,c,v
+    except:
+        return None
 
-        results[tf] = (np.array(closes), volumes, data)
+def get_ohlc_coingecko(symbol):
+    try:
+        coin = symbol.replace("USDT","").lower()
+        url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=365"
+        data = safe_request(url)
+        prices = data.get("prices",[]) if data else []
+        d,o,h,l,c,v=[],[],[],[],[],[]
+        for i in range(1,len(prices)):
+            tstamp = datetime.fromtimestamp(prices[i][0]/1000)
+            prev = prices[i-1][1]; curr = prices[i][1]
+            d.append(tstamp)
+            o.append(prev); h.append(max(prev,curr))
+            l.append(min(prev,curr)); c.append(curr)
+            v.append(0)
+        return d,o,h,l,c,v
+    except:
+        return None
 
-    return results
+def get_ohlc(symbol, timeframe):
+    mapping = {"15 Min":("15m",96),"Hourly":("1h",48),"Daily":("1d",180)}
+    interval, limit = mapping[timeframe]
+    funcs = [get_ohlc_binance,get_ohlc_cryptocompare,get_ohlc_coingecko]
+    for fn in funcs:
+        try:
+            data = fn(symbol,interval,limit) if fn!=get_ohlc_coingecko else fn(symbol)
+            if data: return data, fn.__name__
+        except: continue
+    return None,"None"
 
 # =========================
 # INDICATORS
 # =========================
-def rsi(prices):
+def rsi(prices, period=14):
+    prices=np.array(prices)
+    if len(prices)<period+1: return np.array([50]*len(prices))
     delta = np.diff(prices)
     gain = np.maximum(delta,0)
     loss = np.abs(np.minimum(delta,0))
-    rs = pd.Series(gain).rolling(14).mean() / (pd.Series(loss).rolling(14).mean()+1e-9)
+    avg_gain = pd.Series(gain).rolling(period,min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(period,min_periods=1).mean()
+    rs = avg_gain/(avg_loss+1e-9)
     return np.concatenate([[50],100-(100/(1+rs))])
 
 def macd(prices):
-    exp1 = pd.Series(prices).ewm(span=12).mean()
-    exp2 = pd.Series(prices).ewm(span=26).mean()
-    m = exp1-exp2
-    s = m.ewm(span=9).mean()
-    return m.values, s.values
+    prices=np.array(prices)
+    if len(prices)<26: return np.zeros(len(prices)), np.zeros(len(prices))
+    exp1=pd.Series(prices).ewm(span=12,adjust=False).mean()
+    exp2=pd.Series(prices).ewm(span=26,adjust=False).mean()
+    m=exp1-exp2
+    s=m.ewm(span=9,adjust=False).mean()
+    return m.values,s.values
 
 # =========================
-# AI
+# LSTM MODEL
 # =========================
-def train_ai(prices):
-    if len(prices)<50:
-        return None
+@st.cache_resource(ttl=1800)
+def train_lstm(prices):
+    scaler=MinMaxScaler()
+    data=scaler.fit_transform(np.array(prices).reshape(-1,1))
     X,y=[],[]
-    for i in range(20,len(prices)-1):
-        w = prices[i-20:i]
-        X.append([np.mean(w),np.std(w),w[-1]-w[0]])
-        y.append(1 if prices[i+1]>prices[i] else 0)
-    m = LogisticRegression()
-    m.fit(X,y)
-    return m
+    for i in range(20,len(data)):
+        X.append(data[i-20:i]); y.append(data[i])
+    X,y=np.array(X),np.array(y)
+    model=Sequential([LSTM(50,input_shape=(20,1)),Dense(1)])
+    model.compile("adam","mse")
+    model.fit(X,y,epochs=3,verbose=0)
+    return model,scaler
 
-def ai_predict(m, prices):
-    if not m or len(prices)<20:
-        return 0.5
-    w = prices[-20:]
-    return m.predict_proba([[np.mean(w),np.std(w),w[-1]-w[0]]])[0][1]
-
-# =========================
-# SIGNAL
-# =========================
-def generate_signal(c, v):
-    r = rsi(c)
-    m, s = macd(c)
-    ai = ai_predict(train_ai(c), c)
-
-    if r[-1] < 35 and m[-1] > s[-1] and ai > 0.55:
-        return "BUY"
-    if r[-1] > 65 and m[-1] < s[-1] and ai < 0.45:
-        return "SELL"
-    return "HOLD"
-
-def multi_tf_signal(symbol):
-    data = get_multi_tf(symbol)
-    if not data:
-        return "HOLD"
-
-    signals = []
-    for tf in data:
-        c, v, _ = data[tf]
-        signals.append(generate_signal(c, v))
-
-    if signals.count("BUY") >= 2:
-        return "BUY"
-    if signals.count("SELL") >= 2:
-        return "SELL"
-    return "HOLD"
+def lstm_predict(model,scaler,prices):
+    data=scaler.transform(np.array(prices).reshape(-1,1))
+    seq=data[-20:]
+    pred=model.predict(seq.reshape(1,20,1),verbose=0)
+    return scaler.inverse_transform(pred)[0][0]
 
 # =========================
-# TRADING ENGINE
+# SENTIMENT
 # =========================
-RISK = 0.1
-
-def open_position(sym, signal, price):
-    capital = st.session_state.balance * RISK
-
-    st.session_state.positions[sym] = {
-        "type": "LONG" if signal=="BUY" else "SHORT",
-        "entry": price,
-        "size": capital,
-        "sl": price*0.97 if signal=="BUY" else price*1.03,
-        "tp": price*1.05 if signal=="BUY" else price*0.95
-    }
-
-def close_position(sym, price):
-    pos = st.session_state.positions.get(sym)
-    if not pos:
-        return
-
-    entry = pos["entry"]
-    size = pos["size"]
-
-    if pos["type"]=="LONG":
-        pct = (price-entry)/entry
-    else:
-        pct = (entry-price)/entry
-
-    profit = size * pct
-    st.session_state.balance += profit
-
-    trade = {
-        "symbol": sym,
-        "type": pos["type"],
-        "entry": entry,
-        "exit": price,
-        "profit": profit,
-        "time": str(datetime.now())
-    }
-
-    st.session_state.trade_history.append(trade)
-
-    # SAVE TO FIREBASE
+@st.cache_data(ttl=900)
+def get_sentiment():
     try:
-        db.reference("trades").push(trade)
+        data = safe_request("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
+        scores=[]
+        for a in data.get("Data",[])[:5]:
+            text = a.get("title","")
+            v = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
+            b = TextBlob(text).sentiment.polarity
+            scores.append((v+b)/2)
+        return np.mean(scores) if scores else 0
     except:
-        pass
-
-    del st.session_state.positions[sym]
+        return 0
 
 # =========================
-# UI
+# SUPPORT/RESISTANCE & SPIKE
 # =========================
-st.title("🚀 AI Crypto Bot PRO DEMO")
-
-COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT"]
-
-st.sidebar.header("🧪 Demo Trading")
-
-if st.sidebar.button("Reset"):
-    st.session_state.balance = 10000
-    st.session_state.positions = {}
-    st.session_state.trade_history = []
-
-st.sidebar.write(f"Balance: ${round(st.session_state.balance,2)}")
-st.sidebar.write(f"Open Positions: {len(st.session_state.positions)}")
+def support_resistance(prices): return min(prices[-50:]), max(prices[-50:])
+def detect_spike(prices):
+    change=(prices[-1]-prices[-5])/prices[-5]
+    if change<-0.05: return "🔻 Sharp Drop"
+    if change>0.05: return "🚀 Sharp Rise"
+    return "Normal"
 
 # =========================
-# MAIN LOOP
+# DEMO TRADE UTILS
 # =========================
-for sym in COINS:
+def calculate_tp_sl(entry_price, tp_percent, sl_percent, long=True):
+    if long:
+        tp = entry_price*(1+tp_percent/100)
+        sl = entry_price*(1-sl_percent/100)
+    else:
+        tp = entry_price*(1-sl_percent/100)
+        sl = entry_price*(1+tp_percent/100)
+    return tp,sl
 
-    if sym not in ws_prices:
-        start_ws(sym)
-
-    data = get_multi_tf(sym)
-    if not data:
-        continue
-
-    c = data["15m"][0]
-    raw = data["15m"][2]
-
-    fd = [datetime.fromtimestamp(k[0]/1000) for k in raw]
-    o = [float(k[1]) for k in raw]
-    h = [float(k[2]) for k in raw]
-    l = [float(k[3]) for k in raw]
-
-    signal = multi_tf_signal(sym)
-    price = c[-1]
-
-    # Trading logic
-    pos = st.session_state.positions.get(sym)
-
-    if not pos and signal in ["BUY","SELL"]:
-        open_position(sym, signal, price)
-
-    if pos:
-        if pos["type"]=="LONG" and (price<=pos["sl"] or price>=pos["tp"]):
-            close_position(sym, price)
-        elif pos["type"]=="SHORT" and (price>=pos["sl"] or price<=pos["tp"]):
-            close_position(sym, price)
-
-    # UI
-    with st.container():
-        st.markdown(f"### {sym}")
-        col1,col2 = st.columns([3,1])
-
-        with col1:
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
-            st.plotly_chart(fig,use_container_width=True)
-
-        with col2:
-            st.write(f"Signal: {signal}")
-            st.write(f"Price: {round(price,2)}")
+def update_demo_trade(trade, current_price):
+    long = trade["long"]
+    closed = False
+    recommendation = "Hold"
+    if long:
+        if current_price>=trade["tp"]:
+            recommendation="Take Profit"
+            closed=True
+        elif current_price<=trade["sl"]:
+            recommendation="Stop Loss"
+            closed=True
+    else:
+        if current_price<=trade["tp"]:
+            recommendation="Take Profit"
+            closed=True
+        elif current_price>=trade["sl"]:
+            recommendation="Stop Loss"
+            closed=True
+    if closed:
+        trade["exit_price"] = current_price
+        trade["closed"] = True
+        trade["pnl"] = (current_price-trade["entry"])*trade["amount"] if long else (trade["entry"]-current_price)*trade["amount"]
+    else:
+        trade["pnl"] = (current_price-trade["entry"])*trade["amount"] if long else (trade["entry"]-current_price)*trade["amount"]
+    return trade, recommendation
 
 # =========================
-# PERFORMANCE
+# UI SETUP
 # =========================
-trades = st.session_state.trade_history
+st.title("🚀 AI Crypto Bot Demo")
 
-if trades:
-    wins = sum(1 for t in trades if t["profit"]>0)
-    total = len(trades)
-    winrate = wins/total*100
-    profit = sum(t["profit"] for t in trades)
+COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
+timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily"])
+symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT","ETHUSDT"])
 
-    st.markdown("### 📊 Performance")
-    st.write(f"Trades: {total}")
-    st.write(f"Winrate: {round(winrate,2)}%")
-    st.write(f"Profit: ${round(profit,2)}")
+# =========================
+# AUTO SPOT PORTFOLIO
+# =========================
+portfolio = {sym:{"amount":1,"entry":0,"pnl":0} for sym in COINS}  # 1 coin each demo
 
-    st.dataframe(pd.DataFrame(trades).tail(10))
+# =========================
+# MAIN LOOP PER COIN
+# =========================
+st.session_state.loading=True
+for sym in symbols:
+    try:
+        if sym not in ws_prices: start_ws(sym)
+        data, source = get_ohlc(sym,timeframe)
+        if data is None: continue
+        fd,o,h,l,c,v=data
+        c=np.array(c)
+        if len(c)<20: continue
+
+        # Indicators
+        r = rsi(c)
+        m,sig = macd(c)
+        sentiment = get_sentiment()
+        model,scaler = train_lstm(c)
+        pred = lstm_predict(model,scaler,c)
+        sup,res = support_resistance(c)
+        spike = detect_spike(c)
+        conf = max(0,min(100,100*(1-np.std(c)/c[-1])))
+
+        # =========================
+        # CHARTS
+        # =========================
+        with st.container():
+            st.markdown(f"### {sym}",unsafe_allow_html=True)
+            col1,col2=st.columns([3,1])
+            with col1:
+                fig=go.Figure()
+                fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
+                fig.add_trace(go.Scatter(x=fd,y=[pred]*len(fd),line=dict(color="yellow"),name="Prediction"))
+                fig.add_hline(y=sup,line_dash="dash",line_color="green")
+                fig.add_hline(y=res,line_dash="dash",line_color="red")
+                fig.update_layout(dragmode="zoom")
+                st.plotly_chart(fig,use_container_width=True)
+
+            with col2:
+                st.write(f"Confidence: {round(conf,2)}%")
+                st.write(f"Sentiment: {round(sentiment,2)}")
+                st.write(f"Spike: {spike}")
+                st.write(f"LSTM Prediction: {round(pred,2)}")
+
+        # =========================
+        # DEMO TRADE PANEL
+        # =========================
+        if sym not in demo_trades: demo_trades[sym]=[]
+        st.markdown("**Demo Trading Panel**")
+        mode = st.selectbox(f"{sym} Mode", ["Spot","Future"], key=f"mode_{sym}")
+
+        if mode=="Future":
+            long_short = st.radio(f"{sym} Direction", ["Long","Short"], key=f"dir_{sym}")
+            amount = st.number_input(f"USDT Amount", min_value=1.0, step=1.0, key=f"amt_{sym}")
+            tp_percent = st.slider("Take Profit %", 1,20,5,key=f"tp_{sym}")
+            sl_percent = st.slider("Stop Loss %",1,20,3,key=f"sl_{sym}")
+            entry_price = ws_prices.get(sym,c[-1])
+            if st.button(f"Open Future {long_short} Trade", key=f"open_{sym}"):
+                demo_trades[sym].append({"mode":"future","long":long_short=="Long",
+                                         "entry":entry_price,"tp":0,"sl":0,
+                                         "amount":amount,"closed":False,"pnl":0})
+                demo_trades[sym][-1]["tp"],demo_trades[sym][-1]["sl"] = calculate_tp_sl(entry_price,tp_percent,sl_percent,long=long_short=="Long")
+
+        # =========================
+        # UPDATE EXISTING TRADES
+        # =========================
+        current_price = ws_prices.get(sym,c[-1])
+        for trade in demo_trades[sym]:
+            if trade.get("closed"): continue
+            trade, rec = update_demo_trade(trade,current_price)
+            st.write(f"Trade: {trade['mode']} | Entry: {trade['entry']:.2f} | P/L: {trade['pnl']:.2f} | Recommendation: {rec}")
+
+        # =========================
+        # AUTO PORTFOLIO P/L
+        # =========================
+        portfolio[sym]["entry"] = c[-1]
+        portfolio[sym]["pnl"] = c[-1]-c[-2]
+
+    except Exception as e:
+        st.write(f"{sym} Exception: {e}")
+
+st.session_state.loading=False
