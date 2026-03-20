@@ -4,7 +4,7 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import threading, websocket, time
+import threading, websocket
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.preprocessing import MinMaxScaler
@@ -12,16 +12,16 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 
 # =========================
+# GLOBALS
+# =========================
+ws_prices = {}
+last_heavy_update = datetime.min  # fixed: declare global at the top
+
+# =========================
 # SMART REFRESH LOCK
 # =========================
 if "loading" not in st.session_state:
     st.session_state.loading = False
-
-# =========================
-# GLOBALS
-# =========================
-ws_prices = {}
-last_heavy_update = datetime.min
 
 # =========================
 # WEBSOCKET LIVE PRICE
@@ -178,7 +178,6 @@ debug=[]
 # MAIN LOOP
 # =========================
 st.session_state.loading=True
-global last_heavy_update
 
 for sym in symbols:
     if sym not in ws_prices:
@@ -192,18 +191,19 @@ for sym in symbols:
 
     # Recalculate heavy models every 5 min
     now=datetime.utcnow()
+    global last_heavy_update  # <-- already declared at top; optional here
     if (now-last_heavy_update).total_seconds()>300 or last_heavy_update==datetime.min:
-        model,scaler=train_lstm(c)
-        pred=lstm_predict(model,scaler,c)
-        senti=get_sentiment()
-        r=rsi(c)
-        m,sig=macd(c)
-        last_heavy_update=now
+        model, scaler = train_lstm(c)
+        pred = lstm_predict(model, scaler, c)
+        senti = get_sentiment()
+        r = rsi(c)
+        m, sig = macd(c)
+        last_heavy_update = now
     else:
         pred = c[-1]  # fallback prediction
-        senti=0
-        r=np.array([50]*len(c))
-        m,sig=np.zeros(len(c)),np.zeros(len(c))
+        senti = 0
+        r = np.array([50]*len(c))
+        m, sig = np.zeros(len(c)), np.zeros(len(c))
 
     sup,res=support_resistance(c)
     spike=detect_spike(c)
