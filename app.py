@@ -4,42 +4,39 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.graph_objects as go
-from datetime import datetime
-import threading, websocket, sqlite3
+from datetime import datetime, timedelta
+import threading, websocket
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
+import sqlite3
 
 # =========================
-# SMART AUTO REFRESH
+# DATABASE
 # =========================
-if "loading" not in st.session_state:
-    st.session_state.loading = False
-
-if not st.session_state.loading:
-    st_autorefresh(interval=300000, key="refresh")  # 5 min
-
-# =========================
-# DATABASE SETUP
-# =========================
-conn = sqlite3.connect("demo_trades.db", check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS demo_trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+conn = sqlite3.connect("trades.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trades (
+    timestamp TEXT,
     symbol TEXT,
-    mode TEXT,
-    buy_sell TEXT,
-    amount REAL,
+    trade_type TEXT,
     price REAL,
-    tp REAL,
-    sl REAL,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    amount REAL,
+    mode TEXT
 )
 """)
 conn.commit()
+
+# =========================
+# AUTO REFRESH
+# =========================
+if "loading" not in st.session_state:
+    st.session_state.loading = False
+if not st.session_state.loading:
+    st_autorefresh(interval=300000, key="refresh")  # 5 minutes
 
 # =========================
 # GLOBALS
@@ -47,7 +44,7 @@ conn.commit()
 ws_prices = {}
 
 # =========================
-# WEBSOCKET LIVE PRICE
+# WEBSOCKET
 # =========================
 def start_ws(symbol):
     def on_message(ws, message):
@@ -70,6 +67,8 @@ def get_ohlc_binance(symbol, interval, limit):
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         data = requests.get(url, params=params, timeout=5).json()
+        if not isinstance(data, list):
+            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]/1000))
@@ -93,6 +92,8 @@ def get_ohlc_cryptocompare(symbol, interval, limit):
             url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
         data = requests.get(url, timeout=5).json()
         raw = data.get("Data", {}).get("Data", [])
+        if not raw:
+            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for x in raw:
             d.append(datetime.fromtimestamp(x["time"]))
@@ -111,6 +112,8 @@ def get_ohlc_coingecko(symbol):
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=365"
         data = requests.get(url, timeout=5).json()
         prices = data.get("prices", [])
+        if not prices:
+            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for i in range(1,len(prices)):
             t = datetime.fromtimestamp(prices[i][0]/1000)
@@ -232,7 +235,7 @@ def detect_event():
 # =========================
 # UI SETUP
 # =========================
-st.title("🚀 AI Crypto Demo Bot")
+st.title("🚀 AI Crypto Bot Demo")
 
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
 
@@ -240,11 +243,12 @@ timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
 symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT","ETHUSDT"])
 
 debug=[]
-st.session_state.loading = True
 
 # =========================
 # MAIN LOOP
 # =========================
+st.session_state.loading = True
+
 for sym in symbols:
 
     if sym not in ws_prices:
@@ -257,7 +261,6 @@ for sym in symbols:
     fd,o,h,l,c,v=data
     c=np.array(c)
 
-    # Indicators + LSTM + sentiment
     r=rsi(c)
     m,s=macd(c)
     sentiment=get_sentiment()
@@ -269,7 +272,7 @@ for sym in symbols:
     conf=100*(1-np.std(c)/c[-1])
 
     # =========================
-    # CARD UI
+    # CHART & DEMO PANEL
     # =========================
     with st.container():
         st.markdown("<div style='border:1px solid white;padding:10px;border-radius:8px;margin-bottom:10px;'>",unsafe_allow_html=True)
@@ -293,44 +296,33 @@ for sym in symbols:
             st.write(f"Spike: {spike}")
             st.write(f"Events: {events}")
 
-        st.markdown("</div>",unsafe_allow_html=True)
+        # =========================
+        # DEMO TRADING PANEL
+        # =========================
+        st.markdown("#### Demo Trading")
+        mode = st.selectbox("Mode", ["Trade","Future"], key=f"{sym}_mode")
 
-    # =========================
-    # DEMO PANEL
-    # =========================
-    with st.expander(f"🎮 Demo Trading: {sym}"):
-        mode = st.radio("Mode", ["Spot","Futures"], key=f"{sym}_mode")
-
-        buy_sell = st.radio("Action", ["Buy","Sell"] if mode=="Spot" else ["Buy Long","Sell Short"], key=f"{sym}_action")
-        amount = st.number_input("Amount (coins or contracts)",0.0,key=f"{sym}_amt")
-        price = st.number_input("Price (USDT)",0.0,key=f"{sym}_price")
-        tp = st.number_input("Take Profit %",0.0,key=f"{sym}_tp")
-        sl = st.number_input("Stop Loss %",0.0,key=f"{sym}_sl")
-        if st.button("Execute Demo Trade", key=f"{sym}_exec"):
-            c.execute("INSERT INTO demo_trades (symbol, mode, buy_sell, amount, price, tp, sl) VALUES (?,?,?,?,?,?,?)",
-                      (sym, mode, buy_sell, amount, price, tp, sl))
-            conn.commit()
-            st.success("Demo trade executed!")
-
-    # =========================
-    # DEMO STATISTICS
-    # =========================
-    trades = c.execute("SELECT buy_sell, amount, price FROM demo_trades WHERE symbol=?", (sym,)).fetchall()
-    total_trades = len(trades)
-    profit = 0
-    wins = 0
-    for t in trades:
-        action, amt, p = t
-        current_price = ws_prices.get(sym, c[-1])
-        if action in ["Buy","Buy Long"]:
-            pnl = (current_price - p) * amt / p
+        if mode=="Trade":
+            buy_amount = st.number_input(f"Buy Amount ({sym})",0.0,key=f"{sym}_buy_amt")
+            buy_price = st.number_input(f"Buy Price ({sym})",0.0,key=f"{sym}_buy_price")
+            if st.button(f"Buy {sym}",key=f"{sym}_buy_btn"):
+                cursor.execute("INSERT INTO trades VALUES (?,?,?,?,?,?)", 
+                               (str(datetime.now()),sym,"BUY",buy_price,buy_amount,"Trade"))
+                conn.commit()
+                st.success(f"Bought {buy_amount} {sym} at {buy_price}")
         else:
-            pnl = (p - current_price) * amt / p
-        profit += pnl
-        if pnl > 0:
-            wins += 1
-    winrate = round(wins/total_trades*100,2) if total_trades>0 else 0
-    st.write(f"Total Trades: {total_trades} | Winrate: {winrate}% | Profit/Loss: {round(profit,2)} USDT")
+            direction = st.radio("Direction", ["Long","Short"], key=f"{sym}_future_dir")
+            amount = st.number_input(f"Amount ({sym})",0.0,key=f"{sym}_future_amt")
+            price = st.number_input(f"Entry Price ({sym})",0.0,key=f"{sym}_future_price")
+            tp = st.number_input("Take Profit %",0.0,key=f"{sym}_tp")
+            sl = st.number_input("Stop Loss %",0.0,key=f"{sym}_sl")
+            if st.button(f"Open {direction} {sym}",key=f"{sym}_future_btn"):
+                cursor.execute("INSERT INTO trades VALUES (?,?,?,?,?,?)", 
+                               (str(datetime.now()),sym,direction,price,amount,"Future"))
+                conn.commit()
+                st.success(f"{direction} {amount} {sym} at {price} (TP:{tp}%, SL:{sl}%)")
+
+        st.markdown("</div>",unsafe_allow_html=True)
 
 st.session_state.loading = False
 
