@@ -5,29 +5,12 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime
-import threading, websocket
+import threading, websocket, sqlite3
 from textblob import TextBlob
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
-import sqlite3
-
-# =========================
-# DATABASE SETUP
-# =========================
-conn = sqlite3.connect("trades.db", check_same_thread=False)
-c = conn.cursor()
-c.execute("""CREATE TABLE IF NOT EXISTS demo_trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT,
-    mode TEXT,
-    buy_sell TEXT,
-    amount REAL,
-    price REAL,
-    timestamp TEXT
-)""")
-conn.commit()
 
 # =========================
 # SMART AUTO REFRESH
@@ -36,7 +19,27 @@ if "loading" not in st.session_state:
     st.session_state.loading = False
 
 if not st.session_state.loading:
-    st_autorefresh(interval=300000, key="refresh")  # 5 min refresh
+    st_autorefresh(interval=300000, key="refresh")  # 5 min
+
+# =========================
+# DATABASE SETUP
+# =========================
+conn = sqlite3.connect("demo_trades.db", check_same_thread=False)
+c = conn.cursor()
+c.execute("""
+CREATE TABLE IF NOT EXISTS demo_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT,
+    mode TEXT,
+    buy_sell TEXT,
+    amount REAL,
+    price REAL,
+    tp REAL,
+    sl REAL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
 
 # =========================
 # GLOBALS
@@ -60,15 +63,13 @@ def start_ws(symbol):
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# OLD DATA FETCHING
+# DATA FETCHING (OLD WAY)
 # =========================
 def get_ohlc_binance(symbol, interval, limit):
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         data = requests.get(url, params=params, timeout=5).json()
-        if not isinstance(data, list):
-            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]/1000))
@@ -92,8 +93,6 @@ def get_ohlc_cryptocompare(symbol, interval, limit):
             url = f"https://min-api.cryptocompare.com/data/v2/histoday?fsym={fsym}&tsym=USD&limit={limit}"
         data = requests.get(url, timeout=5).json()
         raw = data.get("Data", {}).get("Data", [])
-        if not raw:
-            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for x in raw:
             d.append(datetime.fromtimestamp(x["time"]))
@@ -112,8 +111,6 @@ def get_ohlc_coingecko(symbol):
         url = f"https://api.coingecko.com/api/v3/coins/{coin}/market_chart?vs_currency=usd&days=365"
         data = requests.get(url, timeout=5).json()
         prices = data.get("prices", [])
-        if not prices:
-            return None
         d,o,h,l,c,v = [],[],[],[],[],[]
         for i in range(1,len(prices)):
             t = datetime.fromtimestamp(prices[i][0]/1000)
@@ -149,7 +146,7 @@ def get_ohlc(symbol, timeframe, debug):
     return None
 
 # =========================
-# INDICATORS & LSTM
+# INDICATORS
 # =========================
 def rsi(prices):
     delta=np.diff(prices)
@@ -165,6 +162,9 @@ def macd(prices):
     s=m.ewm(span=9).mean()
     return m.values,s.values
 
+# =========================
+# LSTM MODEL
+# =========================
 @st.cache_resource(ttl=1800)
 def train_lstm(prices):
     scaler=MinMaxScaler()
@@ -203,17 +203,48 @@ def get_sentiment():
         return 0
 
 # =========================
-# UI & MAIN LOOP
+# SUPPORT / RESISTANCE
 # =========================
-st.title("🚀 AI Crypto Bot - Demo Version")
+def support_resistance(prices):
+    return min(prices[-50:]), max(prices[-50:])
+
+# =========================
+# SPIKE + EVENT
+# =========================
+def detect_spike(prices):
+    change=(prices[-1]-prices[-5])/prices[-5]
+    if change<-0.05: return "🔻 Sharp Drop"
+    if change>0.05: return "🚀 Sharp Rise"
+    return "Normal"
+
+def detect_event():
+    try:
+        data=requests.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN").json()
+        events=[]
+        for a in data.get("Data",[])[:10]:
+            t=a["title"].lower()
+            if "fed" in t: events.append("Fed Impact")
+            if "regulation" in t: events.append("Regulation")
+        return list(set(events))
+    except:
+        return []
+
+# =========================
+# UI SETUP
+# =========================
+st.title("🚀 AI Crypto Demo Bot")
 
 COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
+
 timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
 symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT","ETHUSDT"])
 
 debug=[]
 st.session_state.loading = True
 
+# =========================
+# MAIN LOOP
+# =========================
 for sym in symbols:
 
     if sym not in ws_prices:
@@ -226,46 +257,80 @@ for sym in symbols:
     fd,o,h,l,c,v=data
     c=np.array(c)
 
+    # Indicators + LSTM + sentiment
     r=rsi(c)
     m,s=macd(c)
     sentiment=get_sentiment()
     model,scaler=train_lstm(c)
     pred=lstm_predict(model,scaler,c)
+    sup,res=support_resistance(c)
+    spike=detect_spike(c)
+    events=detect_event()
+    conf=100*(1-np.std(c)/c[-1])
 
     # =========================
-    # CHART
+    # CARD UI
     # =========================
     with st.container():
         st.markdown("<div style='border:1px solid white;padding:10px;border-radius:8px;margin-bottom:10px;'>",unsafe_allow_html=True)
         st.markdown(f"### {sym}")
+
         col1,col2=st.columns([3,1])
 
         with col1:
             fig=go.Figure()
             fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
             fig.add_trace(go.Scatter(x=fd,y=[pred]*len(fd),line=dict(color="yellow"),name="Prediction"))
+            fig.add_hline(y=sup,line_dash="dash",line_color="green")
+            fig.add_hline(y=res,line_dash="dash",line_color="red")
             fig.update_layout(dragmode="zoom")
             st.plotly_chart(fig,use_container_width=True)
 
         with col2:
             st.write(f"Prediction: {round(pred,2)}")
+            st.write(f"Confidence: {round(conf,2)}%")
             st.write(f"Sentiment: {round(sentiment,2)}")
-
-        # =========================
-        # DEMO PANEL
-        # =========================
-        st.markdown("#### Demo Trading")
-        mode = st.selectbox("Mode", ["Spot", "Future"], key=f"mode_{sym}")
-        trade_action = st.selectbox("Action", ["Buy", "Sell", "Buy Long", "Sell Short"], key=f"action_{sym}")
-        amount = st.number_input("Amount (USDT)", min_value=0.0, key=f"amt_{sym}")
-        price = st.number_input("Price (USD)", min_value=0.0, key=f"price_{sym}")
-        if st.button(f"Execute Trade {sym}"):
-            c.execute("INSERT INTO demo_trades (symbol, mode, buy_sell, amount, price, timestamp) VALUES (?,?,?,?,?,?)",
-                      (sym, mode, trade_action, amount, price, str(datetime.now())))
-            conn.commit()
-            st.success(f"Trade Executed: {trade_action} {amount} {sym} @ {price}")
+            st.write(f"Spike: {spike}")
+            st.write(f"Events: {events}")
 
         st.markdown("</div>",unsafe_allow_html=True)
+
+    # =========================
+    # DEMO PANEL
+    # =========================
+    with st.expander(f"🎮 Demo Trading: {sym}"):
+        mode = st.radio("Mode", ["Spot","Futures"], key=f"{sym}_mode")
+
+        buy_sell = st.radio("Action", ["Buy","Sell"] if mode=="Spot" else ["Buy Long","Sell Short"], key=f"{sym}_action")
+        amount = st.number_input("Amount (coins or contracts)",0.0,key=f"{sym}_amt")
+        price = st.number_input("Price (USDT)",0.0,key=f"{sym}_price")
+        tp = st.number_input("Take Profit %",0.0,key=f"{sym}_tp")
+        sl = st.number_input("Stop Loss %",0.0,key=f"{sym}_sl")
+        if st.button("Execute Demo Trade", key=f"{sym}_exec"):
+            c.execute("INSERT INTO demo_trades (symbol, mode, buy_sell, amount, price, tp, sl) VALUES (?,?,?,?,?,?,?)",
+                      (sym, mode, buy_sell, amount, price, tp, sl))
+            conn.commit()
+            st.success("Demo trade executed!")
+
+    # =========================
+    # DEMO STATISTICS
+    # =========================
+    trades = c.execute("SELECT buy_sell, amount, price FROM demo_trades WHERE symbol=?", (sym,)).fetchall()
+    total_trades = len(trades)
+    profit = 0
+    wins = 0
+    for t in trades:
+        action, amt, p = t
+        current_price = ws_prices.get(sym, c[-1])
+        if action in ["Buy","Buy Long"]:
+            pnl = (current_price - p) * amt / p
+        else:
+            pnl = (p - current_price) * amt / p
+        profit += pnl
+        if pnl > 0:
+            wins += 1
+    winrate = round(wins/total_trades*100,2) if total_trades>0 else 0
+    st.write(f"Total Trades: {total_trades} | Winrate: {winrate}% | Profit/Loss: {round(profit,2)} USDT")
 
 st.session_state.loading = False
 
