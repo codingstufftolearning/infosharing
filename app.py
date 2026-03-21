@@ -65,7 +65,7 @@ conn.commit()
 # AUTO REFRESH
 # =========================
 
-st_autorefresh(interval=30000, key="refresh")
+st_autorefresh(interval=90000, key="refresh")
 
 # =========================
 # DATA FETCH
@@ -217,7 +217,7 @@ def macd(prices):
 # LSTM
 # =========================
 
-@st.cache_resource(ttl=1800)
+@st.cache_resource(ttl=21600)
 def train_lstm(prices):
 
     scaler=MinMaxScaler()
@@ -471,7 +471,7 @@ for sym in symbols:
             1-learning_bias
         )
 
-        trade_count=random.randint(2,5)
+        trade_count=random.randint(1,2)
 
         for _ in range(trade_count):
 
