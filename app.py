@@ -37,7 +37,7 @@ import uuid
 import json
 
 # =========================
-# DATABASE SETUP
+# DATABASE SETUP (SAFE)
 # =========================
 conn = sqlite3.connect("trade_history.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -97,7 +97,7 @@ def get_learning_stats(symbol):
         params=(symbol,)
     )
     if df.empty:
-        return 0.5  # neutral
+        return 0.5
     wins = len(df[df["pl"] > 0])
     losses = len(df[df["pl"] <= 0])
     total = wins + losses
@@ -121,7 +121,7 @@ def can_auto_trade_coin(symbol):
     return datetime.now() - last_trade_time > timedelta(minutes=TRADE_INTERVAL_MINUTES)
 
 # =========================
-# WEBSOCKET LIVE PRICE
+# WEBSOCKET LIVE PRICE (SAFE)
 # =========================
 def start_ws(symbol):
     """Start a websocket to get live price updates."""
@@ -132,12 +132,13 @@ def start_ws(symbol):
                 ws_prices[symbol] = float(data["c"])
         except Exception as e:
             debug.append(f"WS {symbol} error: {str(e)}")
+
     url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# MULTI-SOURCE DATA FETCH
+# MULTI-SOURCE DATA FETCH (SAFE)
 # =========================
 def fetch_binance(symbol, interval, limit):
     try:
@@ -270,7 +271,7 @@ def lstm_predict(model,scaler,prices):
     return scaler.inverse_transform(pred)[0][0]
 
 # =========================
-# AI DECISION
+# AI DECISION WITH LEARNING
 # =========================
 def ai_trade_decision(symbol,prices,rsi_vals,macd_vals,signal_vals,prediction):
     price=prices[-1]
@@ -285,46 +286,39 @@ def ai_trade_decision(symbol,prices,rsi_vals,macd_vals,signal_vals,prediction):
     return "HOLD"
 
 # =========================
-# AUTO TRADE
+# AUTO TRADE WITH INFINITE BALANCE (DEMO)
 # =========================
-def execute_auto_trade(sym,decision,price,confidence):
+virtual_balance = {}  # coin -> balance
+
+def execute_virtual_trade(sym,decision,price,confidence):
     if decision=="HOLD":
         return
-    trade_id=str(uuid.uuid4())
-    amount=0.01
-    tp_percent=1.5
-    sl_percent=1.0
+    if sym not in virtual_balance:
+        virtual_balance[sym] = 100000  # start with 100k demo balance
+    trade_id = str(uuid.uuid4())
+    amount = 1000  # fixed virtual amount per trade
+    tp_percent = 1.5
+    sl_percent = 1.0
     if decision=="BUY":
-        tp_price=price*(1+tp_percent/100)
-        sl_price=price*(1-sl_percent/100)
+        tp_price = price*(1+tp_percent/100)
+        sl_price = price*(1-sl_percent/100)
     else:
-        tp_price=price*(1-tp_percent/100)
-        sl_price=price*(1+sl_percent/100)
+        tp_price = price*(1-tp_percent/100)
+        sl_price = price*(1+sl_percent/100)
+    # simulate P/L
+    if decision=="BUY":
+        pl = (tp_price - price) * amount
+    else:
+        pl = (price - tp_price) * amount
+    virtual_balance[sym] += pl
+    # store in database for tracking
     cursor.execute("""
     INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """,
-    (
-        datetime.now().isoformat(),
-        sym,
-        "AUTO_DEMO",
-        decision,
-        amount,
-        price,
-        0,
-        0,
-        confidence,
-        tp_percent,
-        sl_percent,
-        "AI AUTO TRADE",
-        "OPEN",
-        tp_price,
-        sl_price,
-        trade_id
-    ))
+    """,(datetime.now().isoformat(),sym,"AI_DEMO",decision,amount,price,tp_price,tp_price,confidence,tp_percent,sl_percent,"Infinite Demo Trade","CLOSED",tp_price,sl_price,trade_id))
     conn.commit()
 
 # =========================
-# TP/SL CLOSE
+# CHECK OPEN TRADES
 # =========================
 def check_open_trades():
     df=pd.read_sql_query("SELECT * FROM trades WHERE status='OPEN'",conn)
@@ -351,26 +345,33 @@ def check_open_trades():
                 close=True
             pl=(entry-price)*amount
         if close:
-            cursor.execute("""
-            UPDATE trades SET exit_price=?,pl=?,status='CLOSED' WHERE trade_id=?
-            """,(price,pl,trade_id))
+            cursor.execute("UPDATE trades SET exit_price=?,pl=?,status='CLOSED' WHERE trade_id=?",(price,pl,trade_id))
     conn.commit()
 
 # =========================
 # UI
 # =========================
-st.title("🚀 AI Crypto Bot Demo")
+st.title("🚀 AI Crypto Bot Demo with Infinite Balance")
 
-COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
-timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
-symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT"])
-debug=[]
+COINS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
+
+timeframe = st.selectbox("Select Timeframe", ["15 Min","Hourly","Daily"])
+symbols = st.multiselect("Select Coins", COINS, default=["BTCUSDT"])
+debug = []
+
 st.session_state.loading=True
 
 # =========================
-# MAIN LOOP PER COIN
+# MAIN LOOP
 # =========================
 for sym in symbols:
+
+    col1,col2 = st.columns([2,1])
+
+    with col1:
+        st.subheader(f"{sym}")
+    with col2:
+        auto_mode = st.checkbox("🤖 Auto Demo Trading", key=f"{sym}_auto", value=True)
 
     if sym not in ws_prices:
         start_ws(sym)
@@ -378,10 +379,8 @@ for sym in symbols:
     data=get_ohlc(sym,timeframe,debug)
     if not data:
         continue
-    fd,o,h,l,c,v=data
-    if not (fd and o and h and l and c):
-        continue
 
+    fd,o,h,l,c,v=data
     c=np.array(c)
     r=rsi(c)
     m,s=macd(c)
@@ -390,47 +389,34 @@ for sym in symbols:
     conf=100*(1-np.std(c)/c[-1])
     decision=ai_trade_decision(sym,c,r,m,s,pred)
 
+    if auto_mode:
+        execute_virtual_trade(sym,decision,c[-1],conf)
+
     # =========================
-    # CONTAINER BOX FOR COIN
+    # CHARTS AND STATISTICS
     # =========================
     with st.container():
-        st.markdown(f"### {sym}", unsafe_allow_html=True)
-        auto_mode = st.checkbox("🤖 Enable Auto Demo Trading", key=f"auto_{sym}", value=False)
-
-        # =========================
-        # EXECUTE AUTO TRADE
-        # =========================
-        if auto_mode:
-            if can_auto_trade_coin(sym):
-                execute_auto_trade(sym,decision,c[-1],conf)
-
-        # =========================
-        # CHART + STATISTICS (2 COL)
-        # =========================
-        col1,col2 = st.columns([3,2])
-        with col1:
+        st.markdown(f"### {sym} Chart & Stats")
+        box_col1, box_col2 = st.columns([2,1])
+        with box_col1:
             fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
-            fig.update_layout(height=300,margin=dict(l=10,r=10,t=10,b=10))
+            fig.add_trace(go.Candlestick(x=fd, open=o, high=h, low=l, close=c))
             st.plotly_chart(fig,use_container_width=True)
-        with col2:
+        with box_col2:
             st.markdown("**Statistics**")
-            st.write(f"Current Price: {c[-1]:.2f}")
-            st.write(f"Predicted Price: {pred:.2f}")
+            st.write(f"Latest Price: {c[-1]:.2f}")
             st.write(f"RSI: {r[-1]:.2f}")
             st.write(f"MACD: {m[-1]:.2f}")
-            st.write(f"Signal: {s[-1]:.2f}")
+            st.write(f"LSTM Prediction: {pred:.2f}")
             st.write(f"Confidence: {conf:.2f}%")
-            st.write(f"Decision: {decision}")
+            st.write(f"Virtual Balance: {virtual_balance.get(sym,100000):.2f}")
 
-        # =========================
-        # TRADE HISTORY FOR THIS COIN
-        # =========================
-        st.markdown("**Trade History**")
-        df_coin=pd.read_sql_query(f"SELECT * FROM trades WHERE coin='{sym}' ORDER BY timestamp DESC",conn)
-        st.dataframe(df_coin)
-
-check_open_trades()
+    # =========================
+    # TRADE HISTORY FOR THIS COIN
+    # =========================
+    st.markdown(f"### {sym} AI Demo Trade History")
+    df=pd.read_sql_query("SELECT * FROM trades WHERE coin=? ORDER BY timestamp DESC",conn,params=(sym,))
+    st.dataframe(df)
 
 # =========================
 # DEBUG PANEL
