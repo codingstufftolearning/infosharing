@@ -37,7 +37,7 @@ import uuid
 import json
 
 # =========================
-# DATABASE SETUP (SAFE)
+# DATABASE SETUP
 # =========================
 conn = sqlite3.connect("trade_history.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -91,53 +91,37 @@ TRADE_INTERVAL_MINUTES = 20
 # LEARNING MEMORY
 # =========================
 def get_learning_stats(symbol):
-
     df = pd.read_sql_query(
         "SELECT * FROM trades WHERE coin=? AND status='CLOSED'",
         conn,
         params=(symbol,)
     )
-
     if df.empty:
-        return 0.5  # neutral confidence
-
+        return 0.5  # neutral
     wins = len(df[df["pl"] > 0])
     losses = len(df[df["pl"] <= 0])
-
     total = wins + losses
-
     if total == 0:
         return 0.5
-
-    win_rate = wins / total
-
-    return win_rate
+    return wins / total
 
 # =========================
 # PER COIN TIMER
 # =========================
 def can_auto_trade_coin(symbol):
-
     df = pd.read_sql_query(
         "SELECT * FROM trades WHERE coin=?",
         conn,
         params=(symbol,)
     )
-
     if df.empty:
         return True
-
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-
     last_trade_time = df["timestamp"].max()
-
-    if datetime.now() - last_trade_time > timedelta(minutes=TRADE_INTERVAL_MINUTES):
-        return True
-
-    return False
+    return datetime.now() - last_trade_time > timedelta(minutes=TRADE_INTERVAL_MINUTES)
 
 # =========================
-# WEBSOCKET LIVE PRICE (SAFE)
+# WEBSOCKET LIVE PRICE
 # =========================
 def start_ws(symbol):
     """Start a websocket to get live price updates."""
@@ -148,17 +132,14 @@ def start_ws(symbol):
                 ws_prices[symbol] = float(data["c"])
         except Exception as e:
             debug.append(f"WS {symbol} error: {str(e)}")
-
     url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
-
 # =========================
-# MULTI-SOURCE DATA FETCH (SAFE)
+# MULTI-SOURCE DATA FETCH
 # =========================
 def fetch_binance(symbol, interval, limit):
-    """Fetch OHLCV from Binance"""
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -180,7 +161,6 @@ def fetch_binance(symbol, interval, limit):
         return None
 
 def fetch_coinbase(symbol, timeframe):
-    """Fetch OHLCV from Coinbase"""
     try:
         coin = symbol.replace("USDT","-USD")
         tf_map = {"15 Min":900,"Hourly":3600,"Daily":86400}
@@ -191,7 +171,7 @@ def fetch_coinbase(symbol, timeframe):
         if not isinstance(data,list):
             debug.append(f"{symbol} Coinbase: invalid data")
             return None
-        data.reverse()  # Coinbase returns latest first
+        data.reverse()
         d,o,h,l,c,v=[],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]))
@@ -206,7 +186,6 @@ def fetch_coinbase(symbol, timeframe):
         return None
 
 def fetch_kraken(symbol,timeframe):
-    """Fetch OHLCV from Kraken"""
     try:
         coin = symbol.replace("USDT","USD")
         pair_map = {"BTCUSD":"XXBTZUSD","ETHUSD":"XETHZUSD"}
@@ -233,60 +212,38 @@ def fetch_kraken(symbol,timeframe):
         return None
 
 def get_ohlc(symbol, timeframe, debug):
-    """
-    Try fetching from multiple sources.
-    Returns the first successful dataset.
-    """
     mapping = {"15 Min": ("15m", 96), "Hourly": ("1h", 72), "Daily": ("1d", 180)}
     interval, limit = mapping[timeframe]
-
-    # Try Binance first
     data = fetch_binance(symbol, interval, limit)
     if data:
         debug.append(f"{symbol}: Binance OK")
         return data
-
-    # Then Coinbase
     data = fetch_coinbase(symbol, timeframe)
     if data:
         debug.append(f"{symbol}: Coinbase OK")
         return data
-
-    # Then Kraken
     data = fetch_kraken(symbol, timeframe)
     if data:
         debug.append(f"{symbol}: Kraken OK")
         return data
-
     debug.append(f"{symbol}: All Sources Failed")
     return None
-    
+
 # =========================
 # INDICATORS
 # =========================
 def rsi(prices):
-
     delta=np.diff(prices)
-
     gain=np.maximum(delta,0)
     loss=np.abs(np.minimum(delta,0))
-
-    rs=pd.Series(gain).rolling(14).mean() / (
-        pd.Series(loss).rolling(14).mean()+1e-9
-    )
-
-    return np.concatenate(
-        [[50],100-(100/(1+rs))]
-    )
+    rs=pd.Series(gain).rolling(14).mean() / (pd.Series(loss).rolling(14).mean()+1e-9)
+    return np.concatenate([[50],100-(100/(1+rs))])
 
 def macd(prices):
-
     exp1=pd.Series(prices).ewm(span=12).mean()
     exp2=pd.Series(prices).ewm(span=26).mean()
-
     m=exp1-exp2
     s=m.ewm(span=9).mean()
-
     return m.values,s.values
 
 # =========================
@@ -294,110 +251,55 @@ def macd(prices):
 # =========================
 @st.cache_resource(ttl=1800)
 def train_lstm(prices):
-
     scaler=MinMaxScaler()
-
-    data=scaler.fit_transform(
-        np.array(prices).reshape(-1,1)
-    )
-
+    data=scaler.fit_transform(np.array(prices).reshape(-1,1))
     X,y=[],[]
-
     for i in range(20,len(data)):
         X.append(data[i-20:i])
         y.append(data[i])
-
     X,y=np.array(X),np.array(y)
-
-    model=Sequential([
-        LSTM(50,input_shape=(20,1)),
-        Dense(1)
-    ])
-
+    model=Sequential([LSTM(50,input_shape=(20,1)),Dense(1)])
     model.compile("adam","mse")
-
     model.fit(X,y,epochs=3,verbose=0)
-
     return model,scaler
 
 def lstm_predict(model,scaler,prices):
-
-    data=scaler.transform(
-        np.array(prices).reshape(-1,1)
-    )
-
+    data=scaler.transform(np.array(prices).reshape(-1,1))
     seq=data[-20:]
-
-    pred=model.predict(
-        seq.reshape(1,20,1),
-        verbose=0
-    )
-
+    pred=model.predict(seq.reshape(1,20,1),verbose=0)
     return scaler.inverse_transform(pred)[0][0]
 
 # =========================
-# AI DECISION WITH LEARNING
+# AI DECISION
 # =========================
-def ai_trade_decision(
-    symbol,
-    prices,
-    rsi_vals,
-    macd_vals,
-    signal_vals,
-    prediction
-):
-
+def ai_trade_decision(symbol,prices,rsi_vals,macd_vals,signal_vals,prediction):
     price=prices[-1]
-
     r=rsi_vals[-1]
     m=macd_vals[-1]
     s=signal_vals[-1]
-
     learning_bias=get_learning_stats(symbol)
-
-    if (
-        r<35 and
-        m>s and
-        prediction>price and
-        learning_bias>0.4
-    ):
+    if r<35 and m>s and prediction>price and learning_bias>0.4:
         return "BUY"
-
-    if (
-        r>70 and
-        m<s and
-        prediction<price and
-        learning_bias>0.4
-    ):
+    if r>70 and m<s and prediction<price and learning_bias>0.4:
         return "SELL"
-
     return "HOLD"
 
 # =========================
 # AUTO TRADE
 # =========================
 def execute_auto_trade(sym,decision,price,confidence):
-
     if decision=="HOLD":
         return
-
     trade_id=str(uuid.uuid4())
-
     amount=0.01
-
     tp_percent=1.5
     sl_percent=1.0
-
     if decision=="BUY":
-
         tp_price=price*(1+tp_percent/100)
         sl_price=price*(1-sl_percent/100)
-
     else:
-
         tp_price=price*(1-tp_percent/100)
         sl_price=price*(1+sl_percent/100)
-
     cursor.execute("""
     INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """,
@@ -419,71 +321,39 @@ def execute_auto_trade(sym,decision,price,confidence):
         sl_price,
         trade_id
     ))
-
     conn.commit()
 
 # =========================
 # TP/SL CLOSE
 # =========================
 def check_open_trades():
-
-    df=pd.read_sql_query(
-        "SELECT * FROM trades WHERE status='OPEN'",
-        conn
-    )
-
+    df=pd.read_sql_query("SELECT * FROM trades WHERE status='OPEN'",conn)
     if df.empty:
         return
-
     for i,row in df.iterrows():
-
         coin=row["coin"]
-
         if coin not in ws_prices:
             continue
-
         price=ws_prices[coin]
-
         entry=row["entry_price"]
         amount=row["amount"]
-
         tp_price=row["tp_price"]
         sl_price=row["sl_price"]
-
         action=row["action"]
         trade_id=row["trade_id"]
-
         close=False
-
         if action=="BUY":
-
-            if price>=tp_price:
+            if price>=tp_price or price<=sl_price:
                 close=True
-
-            if price<=sl_price:
-                close=True
-
             pl=(price-entry)*amount
-
         elif action=="SELL":
-
-            if price<=tp_price:
+            if price<=tp_price or price>=sl_price:
                 close=True
-
-            if price>=sl_price:
-                close=True
-
             pl=(entry-price)*amount
-
         if close:
-
             cursor.execute("""
-            UPDATE trades
-            SET exit_price=?,pl=?,status='CLOSED'
-            WHERE trade_id=?
-            """,
-            (price,pl,trade_id))
-
+            UPDATE trades SET exit_price=?,pl=?,status='CLOSED' WHERE trade_id=?
+            """,(price,pl,trade_id))
     conn.commit()
 
 # =========================
@@ -491,36 +361,14 @@ def check_open_trades():
 # =========================
 st.title("🚀 AI Crypto Bot Demo")
 
-auto_mode=st.sidebar.toggle(
-"🤖 Enable Auto Demo Trading",
-value=False
-)
-
-COINS=[
-"BTCUSDT",
-"ETHUSDT",
-"BNBUSDT",
-"ADAUSDT",
-"SOLUSDT"
-]
-
-timeframe=st.selectbox(
-"Select Timeframe",
-["15 Min","Hourly","Daily"]
-)
-
-symbols=st.multiselect(
-"Select Coins",
-COINS,
-default=["BTCUSDT"]
-)
-
+COINS=["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT"]
+timeframe=st.selectbox("Select Timeframe",["15 Min","Hourly","Daily"])
+symbols=st.multiselect("Select Coins",COINS,default=["BTCUSDT"])
 debug=[]
-
 st.session_state.loading=True
 
 # =========================
-# MAIN LOOP
+# MAIN LOOP PER COIN
 # =========================
 for sym in symbols:
 
@@ -528,68 +376,69 @@ for sym in symbols:
         start_ws(sym)
 
     data=get_ohlc(sym,timeframe,debug)
-
     if not data:
         continue
-
     fd,o,h,l,c,v=data
-
-    # SAFE check for plotting
-    if all(len(x) > 0 for x in [fd, o, h, l, c]):
-
-        fig = go.Figure(data=[go.Candlestick(x=fd, open=o, high=h, low=l, close=c)])
-        fig.update_layout(title=f"{sym} Candlestick", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig)
+    if not (fd and o and h and l and c):
+        continue
 
     c=np.array(c)
-
     r=rsi(c)
     m,s=macd(c)
-
     model,scaler=train_lstm(c)
-
     pred=lstm_predict(model,scaler,c)
-
     conf=100*(1-np.std(c)/c[-1])
+    decision=ai_trade_decision(sym,c,r,m,s,pred)
 
-    decision=ai_trade_decision(
-        sym,
-        c,
-        r,
-        m,
-        s,
-        pred
-    )
+    # =========================
+    # CONTAINER BOX FOR COIN
+    # =========================
+    with st.container():
+        st.markdown(f"### {sym}", unsafe_allow_html=True)
+        auto_mode = st.checkbox("🤖 Enable Auto Demo Trading", key=f"auto_{sym}", value=False)
 
-    if auto_mode:
+        # =========================
+        # EXECUTE AUTO TRADE
+        # =========================
+        if auto_mode:
+            if can_auto_trade_coin(sym):
+                execute_auto_trade(sym,decision,c[-1],conf)
 
-        if can_auto_trade_coin(sym):
+        # =========================
+        # CHART + STATISTICS (2 COL)
+        # =========================
+        col1,col2 = st.columns([3,2])
+        with col1:
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(x=fd,open=o,high=h,low=l,close=c))
+            fig.update_layout(height=300,margin=dict(l=10,r=10,t=10,b=10))
+            st.plotly_chart(fig,use_container_width=True)
+        with col2:
+            st.markdown("**Statistics**")
+            st.write(f"Current Price: {c[-1]:.2f}")
+            st.write(f"Predicted Price: {pred:.2f}")
+            st.write(f"RSI: {r[-1]:.2f}")
+            st.write(f"MACD: {m[-1]:.2f}")
+            st.write(f"Signal: {s[-1]:.2f}")
+            st.write(f"Confidence: {conf:.2f}%")
+            st.write(f"Decision: {decision}")
 
-            execute_auto_trade(
-                sym,
-                decision,
-                c[-1],
-                conf
-            )
+        # =========================
+        # TRADE HISTORY FOR THIS COIN
+        # =========================
+        st.markdown("**Trade History**")
+        df_coin=pd.read_sql_query(f"SELECT * FROM trades WHERE coin='{sym}' ORDER BY timestamp DESC",conn)
+        st.dataframe(df_coin)
 
 check_open_trades()
 
-st.markdown("### Trade History")
-
-df=pd.read_sql_query(
-"SELECT * FROM trades ORDER BY timestamp DESC",
-conn
-)
-
-st.dataframe(df)
-
+# =========================
+# DEBUG PANEL
+# =========================
 with st.expander("🧰 Debug Panel"):
-
     if not debug:
         st.write("No debug messages")
-
     else:
-
         for d in debug:
             st.write(d)
 
