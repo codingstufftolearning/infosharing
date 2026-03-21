@@ -114,31 +114,37 @@ def can_auto_trade_coin(symbol):
 
     return False
 
+import json
+
 # =========================
-# WEBSOCKET LIVE PRICE
+# WEBSOCKET LIVE PRICE (SAFE)
 # =========================
 def start_ws(symbol):
+    """Start a websocket to get live price updates."""
     def on_message(ws, message):
         try:
-            data = eval(message)
+            data = json.loads(message)
             if "c" in data:
                 ws_prices[symbol] = float(data["c"])
-        except:
-            pass
+        except Exception as e:
+            debug.append(f"WS {symbol} error: {str(e)}")
 
     url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
+
 # =========================
-# MULTI-SOURCE DATA FETCH
+# MULTI-SOURCE DATA FETCH (SAFE)
 # =========================
 def fetch_binance(symbol, interval, limit):
+    """Fetch OHLCV from Binance"""
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         data = requests.get(url, params=params, timeout=5).json()
         if not isinstance(data, list):
+            debug.append(f"{symbol} Binance: invalid data")
             return None
         d,o,h,l,c,v=[],[],[],[],[],[]
         for k in data:
@@ -149,10 +155,12 @@ def fetch_binance(symbol, interval, limit):
             c.append(float(k[4]))
             v.append(float(k[5]))
         return d,o,h,l,c,v
-    except:
+    except Exception as e:
+        debug.append(f"{symbol} Binance error: {str(e)}")
         return None
 
 def fetch_coinbase(symbol, timeframe):
+    """Fetch OHLCV from Coinbase"""
     try:
         coin = symbol.replace("USDT","-USD")
         tf_map = {"15 Min":900,"Hourly":3600,"Daily":86400}
@@ -161,8 +169,9 @@ def fetch_coinbase(symbol, timeframe):
         params = {"granularity": gran}
         data = requests.get(url, params=params, timeout=5).json()
         if not isinstance(data,list):
+            debug.append(f"{symbol} Coinbase: invalid data")
             return None
-        data.reverse()
+        data.reverse()  # Coinbase returns latest first
         d,o,h,l,c,v=[],[],[],[],[],[]
         for k in data:
             d.append(datetime.fromtimestamp(k[0]))
@@ -172,10 +181,12 @@ def fetch_coinbase(symbol, timeframe):
             c.append(float(k[4]))
             v.append(float(k[5]))
         return d,o,h,l,c,v
-    except:
+    except Exception as e:
+        debug.append(f"{symbol} Coinbase error: {str(e)}")
         return None
 
 def fetch_kraken(symbol,timeframe):
+    """Fetch OHLCV from Kraken"""
     try:
         coin = symbol.replace("USDT","USD")
         pair_map = {"BTCUSD":"XXBTZUSD","ETHUSD":"XETHZUSD"}
@@ -197,26 +208,39 @@ def fetch_kraken(symbol,timeframe):
             c.append(float(k[4]))
             v.append(float(k[6]))
         return d,o,h,l,c,v
-    except:
+    except Exception as e:
+        debug.append(f"{symbol} Kraken error: {str(e)}")
         return None
 
-def get_ohlc(symbol,timeframe,debug):
-    mapping={"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
-    interval,limit=mapping[timeframe]
-    data=fetch_binance(symbol, interval, limit)
+def get_ohlc(symbol, timeframe, debug):
+    """
+    Try fetching from multiple sources.
+    Returns the first successful dataset.
+    """
+    mapping = {"15 Min": ("15m", 96), "Hourly": ("1h", 72), "Daily": ("1d", 180)}
+    interval, limit = mapping[timeframe]
+
+    # Try Binance first
+    data = fetch_binance(symbol, interval, limit)
     if data:
         debug.append(f"{symbol}: Binance OK")
         return data
-    data=fetch_coinbase(symbol, timeframe)
+
+    # Then Coinbase
+    data = fetch_coinbase(symbol, timeframe)
     if data:
         debug.append(f"{symbol}: Coinbase OK")
         return data
-    data=fetch_kraken(symbol, timeframe)
+
+    # Then Kraken
+    data = fetch_kraken(symbol, timeframe)
     if data:
         debug.append(f"{symbol}: Kraken OK")
         return data
+
     debug.append(f"{symbol}: All Sources Failed")
     return None
+    
 # =========================
 # INDICATORS
 # =========================
