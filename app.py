@@ -115,79 +115,108 @@ def can_auto_trade_coin(symbol):
     return False
 
 # =========================
-# WEBSOCKET PRICE
+# WEBSOCKET LIVE PRICE
 # =========================
 def start_ws(symbol):
-
-    def on_message(ws,message):
+    def on_message(ws, message):
         try:
-            data=eval(message)
+            data = eval(message)
             if "c" in data:
-                ws_prices[symbol]=float(data["c"])
+                ws_prices[symbol] = float(data["c"])
         except:
             pass
 
-    url=f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
-
-    ws=websocket.WebSocketApp(url,on_message=on_message)
-
-    threading.Thread(
-        target=ws.run_forever,
-        daemon=True
-    ).start()
+    url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@ticker"
+    ws = websocket.WebSocketApp(url, on_message=on_message)
+    threading.Thread(target=ws.run_forever, daemon=True).start()
 
 # =========================
-# DATA FETCH
+# MULTI-SOURCE DATA FETCH
 # =========================
-def get_ohlc(symbol,timeframe,debug):
-
-    mapping={
-        "15 Min":("15m",96),
-        "Hourly":("1h",72),
-        "Daily":("1d",180)
-    }
-
-    interval,limit=mapping[timeframe]
-
+def fetch_binance(symbol, interval, limit):
     try:
-        url="https://api.binance.com/api/v3/klines"
-
-        params={
-            "symbol":symbol,
-            "interval":interval,
-            "limit":limit
-        }
-
-        data=requests.get(
-            url,
-            params=params,
-            timeout=5
-        ).json()
-
-        if not isinstance(data,list):
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        data = requests.get(url, params=params, timeout=5).json()
+        if not isinstance(data, list):
             return None
-
         d,o,h,l,c,v=[],[],[],[],[],[]
-
         for k in data:
-
             d.append(datetime.fromtimestamp(k[0]/1000))
             o.append(float(k[1]))
             h.append(float(k[2]))
             l.append(float(k[3]))
             c.append(float(k[4]))
             v.append(float(k[5]))
-
-        debug.append(f"{symbol}: Binance OK")
-
         return d,o,h,l,c,v
-
     except:
-
-        debug.append(f"{symbol}: Fetch Failed")
-
         return None
 
+def fetch_coinbase(symbol, timeframe):
+    try:
+        coin = symbol.replace("USDT","-USD")
+        tf_map = {"15 Min":900,"Hourly":3600,"Daily":86400}
+        gran = tf_map[timeframe]
+        url = f"https://api.exchange.coinbase.com/products/{coin}/candles"
+        params = {"granularity": gran}
+        data = requests.get(url, params=params, timeout=5).json()
+        if not isinstance(data,list):
+            return None
+        data.reverse()
+        d,o,h,l,c,v=[],[],[],[],[],[]
+        for k in data:
+            d.append(datetime.fromtimestamp(k[0]))
+            o.append(float(k[3]))
+            h.append(float(k[2]))
+            l.append(float(k[1]))
+            c.append(float(k[4]))
+            v.append(float(k[5]))
+        return d,o,h,l,c,v
+    except:
+        return None
+
+def fetch_kraken(symbol,timeframe):
+    try:
+        coin = symbol.replace("USDT","USD")
+        pair_map = {"BTCUSD":"XXBTZUSD","ETHUSD":"XETHZUSD"}
+        pair = pair_map.get(coin, coin)
+        tf_map={"15 Min":15,"Hourly":60,"Daily":1440}
+        interval=tf_map[timeframe]
+        url="https://api.kraken.com/0/public/OHLC"
+        params={"pair":pair,"interval":interval}
+        data=requests.get(url, params=params, timeout=5).json()
+        result=data.get("result",{})
+        key=list(result.keys())[0]
+        candles=result[key]
+        d,o,h,l,c,v=[],[],[],[],[],[]
+        for k in candles:
+            d.append(datetime.fromtimestamp(int(k[0])))
+            o.append(float(k[1]))
+            h.append(float(k[2]))
+            l.append(float(k[3]))
+            c.append(float(k[4]))
+            v.append(float(k[6]))
+        return d,o,h,l,c,v
+    except:
+        return None
+
+def get_ohlc(symbol,timeframe,debug):
+    mapping={"15 Min":("15m",96),"Hourly":("1h",72),"Daily":("1d",180)}
+    interval,limit=mapping[timeframe]
+    data=fetch_binance(symbol, interval, limit)
+    if data:
+        debug.append(f"{symbol}: Binance OK")
+        return data
+    data=fetch_coinbase(symbol, timeframe)
+    if data:
+        debug.append(f"{symbol}: Coinbase OK")
+        return data
+    data=fetch_kraken(symbol, timeframe)
+    if data:
+        debug.append(f"{symbol}: Kraken OK")
+        return data
+    debug.append(f"{symbol}: All Sources Failed")
+    return None
 # =========================
 # INDICATORS
 # =========================
