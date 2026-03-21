@@ -153,8 +153,9 @@ def start_ws(symbol):
     ws = websocket.WebSocketApp(url, on_message=on_message)
     threading.Thread(target=ws.run_forever, daemon=True).start()
 
+
 # =========================
-# MULTI-SOURCE DATA FETCH (FIXED)
+# MULTI-SOURCE DATA FETCH (SAFE)
 # =========================
 def fetch_binance(symbol, interval, limit):
     """Fetch OHLCV from Binance"""
@@ -198,7 +199,7 @@ def fetch_coinbase(symbol, timeframe):
             h.append(float(k[2]))
             l.append(float(k[1]))
             c.append(float(k[4]))
-            v.append(float(k[5]) if len(k)>5 else 0)
+            v.append(float(k[5]))
         return d,o,h,l,c,v
     except Exception as e:
         debug.append(f"{symbol} Coinbase error: {str(e)}")
@@ -259,7 +260,7 @@ def get_ohlc(symbol, timeframe, debug):
 
     debug.append(f"{symbol}: All Sources Failed")
     return None
-
+    
 # =========================
 # INDICATORS
 # =========================
@@ -529,10 +530,16 @@ for sym in symbols:
     data=get_ohlc(sym,timeframe,debug)
 
     if not data:
-        st.write(f"No data available for {sym}")
         continue
 
     fd,o,h,l,c,v=data
+
+    # SAFE check for plotting
+    if all(len(x) > 0 for x in [fd, o, h, l, c]):
+
+        fig = go.Figure(data=[go.Candlestick(x=fd, open=o, high=h, low=l, close=c)])
+        fig.update_layout(title=f"{sym} Candlestick", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig)
 
     c=np.array(c)
 
@@ -564,16 +571,6 @@ for sym in symbols:
                 c[-1],
                 conf
             )
-
-    # =========================
-    # PLOT CHART
-    # =========================
-    if fd and o and h and l and c:
-        fig = go.Figure(data=[go.Candlestick(x=fd, open=o, high=h, low=l, close=c)])
-        fig.update_layout(title=f"{sym} Candlestick", xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig)
-    else:
-        st.write(f"No chart data for {sym}")
 
 check_open_trades()
 
