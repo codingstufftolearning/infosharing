@@ -308,8 +308,34 @@ for sym in symbols:
 
     # Execute demo trades
     if auto_mode:
-        for _ in range(5):  # simulate multiple trades per refresh
-            execute_demo_trade(sym,decision,c[-1],conf)
+
+    learning_bias = get_learning_stats(sym)
+
+    # exploration chance increases if learning is poor
+    exploration_rate = max(0.3, 1 - learning_bias)
+
+    trade_count = random.randint(2,5)
+
+    for _ in range(trade_count):
+
+        trade_decision = decision
+
+        # If HOLD → explore sometimes
+        if decision == "HOLD":
+
+            if random.random() < exploration_rate:
+
+                trade_decision = random.choice(["BUY","SELL"])
+
+            else:
+                continue
+
+        execute_demo_trade(
+            sym,
+            trade_decision,
+            c[-1],
+            conf
+        )
 
     # Plot chart
     fig = go.Figure()
